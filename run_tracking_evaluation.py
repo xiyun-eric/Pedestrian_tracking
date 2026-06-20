@@ -49,7 +49,6 @@ def run_tracking(video_path: Path, output_dir: Path, max_frames: int = 200, use_
         scene_name: 场景名称过滤
     """
     preset = 'standard'  # 固定使用standard预设
-    eval_metrics = {}
     print("="*60)
     print("行人跟踪与评估")
     print("="*60)
@@ -71,16 +70,13 @@ def run_tracking(video_path: Path, output_dir: Path, max_frames: int = 200, use_
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    if max_frames <= 0:
-        max_frames = total_frames
-
     print(f"视频FPS: {fps}, 总帧数: {total_frames}, 尺寸: {width}x{height}")
     print(f"处理帧数: {max_frames}")
 
     # 创建检测器（降低置信度阈值以启用ByteTrack低分框匹配）
     if use_custom_model:
-        # 使用自行训练的模型
-        model_path = project_root / "runs/detect/weights/yolo_custom/train/weights/best.pt"
+        # 使用自行训练的模型（YOLO LoRA微调）
+        model_path = project_root / "runs/yolo_lora/train/weights/best.pt"
         if model_path.exists():
             print(f"[模型] 加载本地训练模型: {model_path.resolve()}")
             print(f"[模型] 文件大小: {model_path.stat().st_size / 1024 / 1024:.1f} MB")
@@ -121,13 +117,15 @@ def run_tracking(video_path: Path, output_dir: Path, max_frames: int = 200, use_
         reid_model='osnet_x1_0',  # 使用OSNet x1_0（MSMT17预训练权重，精度更高）
         device='cpu',
         use_torchreid=True,  # 使用torchreid加载OSNet
+        use_finetuned_reid=use_custom_model,  # custom模式下优先使用微调ReID权重
     )
 
     # 从tracker获取ReID提取器（create_tracker内部已创建）
     reid = tracker.reid_extractor if hasattr(tracker, 'reid_extractor') else None
 
     if reid is not None:
-        print("[ReID] 使用OSNet x1_0（MSMT17行人重识别预训练）")
+        reid_tag = '微调' if use_custom_model else '预训练'
+        print(f"[ReID] 使用OSNet x1_0（{reid_tag}权重）")
     else:
         print("[ReID] 已禁用，使用纯IoU+马氏距离匹配模式")
 
@@ -290,24 +288,7 @@ def run_tracking(video_path: Path, output_dir: Path, max_frames: int = 200, use_
             print(f"GT加载: {len(gt)}帧, 共{sum(len(v) for v in gt.values())}个标注")
             metrics = evaluator.evaluate(eval_predictions, gt)
             metrics.print_report()
-            
-            # 保存评估指标
-            eval_metrics = {
-                "MOTA": metrics.MOTA,
-                "MOTP": metrics.MOTP,
-                "IDF1": metrics.IDF1,
-                "IDSW": metrics.IDSW,
-                "FP": metrics.FP,
-                "FN": metrics.FN,
-                "TP": metrics.TP,
-                "Precision": metrics.precision,
-                "Recall": metrics.recall,
-                "MT": metrics.MT,
-                "ML": metrics.ML,
-                "frag": metrics.Frag,
-                "FPS": stats['total_frames'] / stats['processing_time'],
-            }
-            
+
             # 保存报告
             metrics.save_json(str(output_dir / "evaluation_report.json"))
             metrics.save_csv(str(output_dir / "evaluation_report.csv"))
@@ -322,12 +303,15 @@ def run_tracking(video_path: Path, output_dir: Path, max_frames: int = 200, use_
     print("跟踪与评估完成!")
     print("="*60)
 
-    return eval_metrics
+    return {
+        "FPS": stats['total_frames'] / stats['processing_time'],
+    }
+
 
 def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200, use_custom_model: bool = True,
                         eval_gt: bool = False, labels_dir: Optional[Path] = None, scene_name: Optional[str] = None):
     """
-    运行行人跟踪与评估（图像序列模式，如KITTI数据集）
+    运行行人跟踪与评估（图像序列模式，如MOT17数据集）
 
     Args:
         image_dir: 图像序列目录路径
@@ -339,7 +323,6 @@ def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200
         scene_name: 场景名称过滤
     """
     preset = 'standard'  # 固定使用standard预设
-    eval_metrics = {}
     print("="*60)
     print("行人跟踪与评估（图像序列模式）")
     print("="*60)
@@ -373,8 +356,8 @@ def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200
 
     # 创建检测器（降低置信度阈值以启用ByteTrack低分框匹配）
     if use_custom_model:
-        # 使用自行训练的模型
-        model_path = project_root / "runs/detect/weights/yolo_custom/train/weights/best.pt"
+        # 使用自行训练的模型（YOLO LoRA微调）
+        model_path = project_root / "runs/yolo_lora/train/weights/best.pt"
         if model_path.exists():
             print(f"[模型] 加载本地训练模型: {model_path.resolve()}")
             print(f"[模型] 文件大小: {model_path.stat().st_size / 1024 / 1024:.1f} MB")
@@ -382,8 +365,8 @@ def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200
             detector = YOLODetector(
                 model_path=str(model_path.resolve()),
                 device='cpu',
-                conf_threshold=0.1,  # 降低阈值，让ByteTrack处理低分框
-                iou_threshold=0.5,   # NMS IoU阈值
+                conf_threshold=0.1,
+                iou_threshold=0.5,
                 classes=[0],
             )
         else:
@@ -410,18 +393,20 @@ def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200
     # 创建跟踪器（使用指定预设）
     tracker = create_tracker(
         tracker_type='advanced',
-        preset=preset,  # 使用指定的预设
-        use_reid=True,  # 启用ReID
-        reid_model='osnet_x1_0',  # 使用OSNet x1_0（MSMT17预训练权重，精度更高）
+        preset=preset,
+        use_reid=True,
+        reid_model='osnet_x1_0',
         device='cpu',
-        use_torchreid=True,  # 使用torchreid加载OSNet
+        use_torchreid=True,
+        use_finetuned_reid=use_custom_model,
     )
 
     # 从tracker获取ReID提取器（create_tracker内部已创建）
     reid = tracker.reid_extractor if hasattr(tracker, 'reid_extractor') else None
 
     if reid is not None:
-        print("[ReID] 使用OSNet x1_0（MSMT17行人重识别预训练）")
+        reid_tag = '微调' if use_custom_model else '预训练'
+        print(f"[ReID] 使用OSNet x1_0（{reid_tag}权重）")
     else:
         print("[ReID] 已禁用，使用纯IoU+马氏距离匹配模式")
 
@@ -490,7 +475,6 @@ def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200
 
         # 统计轨迹状态
         active_tracks = [t for t in tracks if t.is_confirmed and t.time_since_update == 0]
-        lost_tracks = [t for t in tracks if t.time_since_update > 0]
 
         stats['total_frames'] += 1
         stats['total_detections'] += len(detections)
@@ -517,10 +501,9 @@ def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200
             bbox = track.get_bbox()
             x1, y1, x2, y2 = map(int, bbox)
 
-            # 收集评估数据
-            if eval_gt:
-                eval_predictions.setdefault(frame_count, {})[tid] = bbox.copy()
-                eval_confidences.setdefault(frame_count, {})[tid] = track.confidence
+            # 收集评估数据（始终收集，供外部评估使用）
+            eval_predictions.setdefault(frame_count, {})[tid] = bbox.copy()
+            eval_confidences.setdefault(frame_count, {})[tid] = track.confidence
 
             # 只绘制活跃轨迹
             cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 2)
@@ -587,23 +570,6 @@ def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200
             metrics = evaluator.evaluate(eval_predictions, gt)
             metrics.print_report()
 
-            # 保存评估指标
-            eval_metrics = {
-                "MOTA": metrics.MOTA,
-                "MOTP": metrics.MOTP,
-                "IDF1": metrics.IDF1,
-                "IDSW": metrics.IDSW,
-                "FP": metrics.FP,
-                "FN": metrics.FN,
-                "TP": metrics.TP,
-                "Precision": metrics.precision,
-                "Recall": metrics.recall,
-                "MT": metrics.MT,
-                "ML": metrics.ML,
-                "frag": metrics.Frag,
-                "FPS": stats['total_frames'] / stats['processing_time'],
-            }
-
             # 保存报告
             metrics.save_json(str(output_dir / "evaluation_report.json"))
             metrics.save_csv(str(output_dir / "evaluation_report.csv"))
@@ -614,11 +580,15 @@ def run_tracking_images(image_dir: Path, output_dir: Path, max_frames: int = 200
     elif eval_gt:
         print("\n[警告] 启用了评估但未提供GT标注目录 (--labels)")
 
+    # 无条件保存MOT格式预测结果，供外部评估使用
+    if eval_predictions:
+        from tools.evaluate import TrackingEvaluator as _Eval
+        _eval = _Eval()
+        _eval.save_predictions_mot(eval_predictions, str(output_dir / "predictions.txt"), eval_confidences)
+
     print("\n" + "="*60)
     print("跟踪与评估完成!")
     print("="*60)
-
-    return eval_metrics
 
 
 def main():
@@ -630,8 +600,8 @@ def main():
     parser.add_argument('--video', type=str, default='data/custom/videos/scene1.mp4',
                         help='视频文件路径')
     parser.add_argument('--images', type=str, default=None,
-                        help='图像序列目录路径（如 data/kitti/0017），与 --video 二选一')
-    parser.add_argument('--frames', type=int, default=0,
+                        help='图像序列目录路径（如 data/MOT17/MOT17-04-FRCNN/img1），与 --video 二选一')
+    parser.add_argument('--frames', type=int, default=200,
                         help='处理帧数，若设置为0表示处理全部帧')
     parser.add_argument('--model', type=str, default='custom',
                         choices=['custom', 'pretrained'],
@@ -642,6 +612,8 @@ def main():
                         help='YOLO格式GT标注目录')
     parser.add_argument('--scene', type=str, default=None,
                         help='场景名称过滤（如scene1, scene2）')
+    parser.add_argument('--output', type=str, default=None,
+                        help='输出目录（默认自动生成）')
 
     args = parser.parse_args()
 
@@ -655,7 +627,11 @@ def main():
             print(f"错误: 图像目录不存在 {image_dir}")
             return
 
-        output_dir = Path("tracking_evaluation") / image_dir.name / args.model
+        if args.output:
+            output_dir = Path(args.output)
+        else:
+            # 输出目录结构: outputs/{model}/{scene_name}/
+            output_dir = Path("outputs") / args.model / image_dir.name
 
         run_tracking_images(image_dir, output_dir, max_frames=args.frames,
                            use_custom_model=use_custom_model,
@@ -672,8 +648,11 @@ def main():
             print(f"错误: 视频文件不存在 {video_path}")
             return
 
-        # 输出目录
-        output_dir = Path("tracking_evaluation") / video_path.stem / args.model
+        if args.output:
+            output_dir = Path(args.output)
+        else:
+            # 输出目录结构: outputs/{model}/{scene_name}/
+            output_dir = Path("outputs") / args.model / video_path.stem
 
         # 运行跟踪与评估（固定使用standard预设）
         run_tracking(video_path, output_dir, max_frames=args.frames,

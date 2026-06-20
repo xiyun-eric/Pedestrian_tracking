@@ -37,5 +37,13 @@ pyyaml>=6.0
 tqdm>=4.65.0
 rich>=13.0.0                # 美化终端输出
 
-# LoRA相关（可选，基础实现已内置）
-# peft>=0.7.0               # HuggingFace PEFT库
+# ============================================================
+# Qwen2-VL 大模型行人跟踪 - 依赖
+# ============================================================
+# HuggingFace 生态
+transformers>=4.45.0        # Qwen2VLForConditionalGeneration
+peft>=0.12.0                # LoRA / QLoRA 微调
+accelerate>=0.34.0          # 分布式训练与模型加载
+bitsandbytes>=0.43.0        # 4bit量化 (QLoRA)
+qwen-vl-utils>=0.0.8       # Qwen2-VL 官方视觉处理工具
+datasets>=3.0.0             # 数据集加载

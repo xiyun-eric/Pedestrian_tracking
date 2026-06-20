@@ -19,6 +19,9 @@ import json
 import argparse
 import re
 from typing import List, Dict, Optional
+from tqdm import tqdm
+
+import numpy as np
 
 # 添加项目根目录到路径
 _project_root = Path(__file__).resolve().parent
@@ -30,6 +33,7 @@ CUSTOM_VIDEOS_DIR = _project_root / "data" / "custom" / "videos"
 CUSTOM_LABELS_DIR = _project_root / "data" / "yolo_custom" / "labels" / "val"
 KITTI_DIR = _project_root / "data" / "kitti"
 KITTI_LABELS_DIR = _project_root / "data" / "kitti" / "labels"
+MOT17_DIR = _project_root / "data" / "MOT17"
 DEFAULT_FRAMES = 150
 
 
@@ -56,9 +60,20 @@ def check_kitti_gt_available(seq_name: str) -> bool:
 
 def run_traditional_method(video_path: Path, scene_name: str, 
                            has_gt: bool, frames: int,
-                           output_dir: Optional[Path] = None) -> Optional[Dict]:
+                           output_dir: Optional[Path] = None,
+                           use_hog_api: bool = True,
+                           use_svm_api: bool = True) -> Optional[Dict]:
     """
     运行传统方法 (HOG+SVM + Kalman)
+    
+    Args:
+        video_path: 视频路径
+        scene_name: 场景名称
+        has_gt: 是否有GT标注
+        frames: 处理帧数
+        output_dir: 输出目录
+        use_hog_api: HOG特征提取是否使用OpenCV API（默认True）
+        use_svm_api: SVM是否使用OpenCV预训练权重（默认True）
     
     Returns:
         评估指标字典，包含MOTA/MOTP/FPS等（如果有GT），否则只包含FPS
@@ -75,6 +90,12 @@ def run_traditional_method(video_path: Path, scene_name: str,
         "--frames", str(frames),
     ]
     
+    # 添加API参数
+    if not use_hog_api:
+        cmd.append("--no-hog-api")
+    if not use_svm_api:
+        cmd.append("--no-svm-api")
+    
     if has_gt:
         cmd.extend([
             "--eval",
@@ -84,17 +105,40 @@ def run_traditional_method(video_path: Path, scene_name: str,
     
     print(f"\n{'='*70}")
     print(f"  传统方法 (HOG+SVM): {scene_name} {'[有GT]' if has_gt else '[无GT-仅FPS]'}")
+    print(f"  HOG模式: {'OpenCV API' if use_hog_api else '手动实现'}")
+    print(f"  SVM模式: {'预训练权重' if use_svm_api else '手动实现'}")
     print(f"{'='*70}")
     
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', cwd=_project_root, timeout=600)
+    # 实时显示子进程输出
+    process = subprocess.Popen(
+        cmd, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.STDOUT,
+        text=True, 
+        encoding='utf-8', 
+        errors='replace',
+        cwd=_project_root
+    )
+    
+    # 实时读取并打印输出
+    output_lines = []
+    while True:
+        line = process.stdout.readline()
+        if not line and process.poll() is not None:
+            break
+        if line:
+            print(line, end='')
+            output_lines.append(line)
+    
+    process.wait(timeout=600)
+    stdout = ''.join(output_lines)
+    stderr = ""
     
     # 解析输出中的统计信息
-    stats = _extract_stats_from_output(result.stdout, result.stderr)
+    stats = _extract_stats_from_output(stdout, stderr)
     
-    if result.returncode != 0:
-        print(f"[警告] 传统方法运行有错误 (returncode={result.returncode})")
-        print(result.stderr[-1500:])
-        # 即使有错误也尝试提取已有信息
+    if process.returncode != 0:
+        print(f"[警告] 传统方法运行有错误 (returncode={process.returncode})")
     
     if has_gt:
         eval_json = output_dir / "evaluation_report.json"
@@ -162,17 +206,39 @@ def run_deep_method(video_path: Path, scene_name: str,
     print(f"  {method_name}: {scene_name} {'[有GT]' if has_gt else '[无GT-仅FPS]'}")
     print(f"{'='*70}")
     
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', cwd=_project_root, timeout=600)
+    # 实时显示子进程输出
+    process = subprocess.Popen(
+        cmd, 
+        stdout=subprocess.PIPE, 
+        stderr=subprocess.STDOUT,
+        text=True, 
+        encoding='utf-8', 
+        errors='replace',
+        cwd=_project_root
+    )
     
-    stats = _extract_stats_from_output(result.stdout, result.stderr)
+    # 实时读取并打印输出
+    output_lines = []
+    while True:
+        line = process.stdout.readline()
+        if not line and process.poll() is not None:
+            break
+        if line:
+            print(line, end='')
+            output_lines.append(line)
     
-    if result.returncode != 0:
-        print(f"[警告] 深度方法运行有错误 (returncode={result.returncode})")
-        print(result.stderr[-1500:])
+    process.wait(timeout=600)
+    stdout = ''.join(output_lines)
+    stderr = ""
+    
+    stats = _extract_stats_from_output(stdout, stderr)
+    
+    if process.returncode != 0:
+        print(f"[警告] 深度方法运行有错误 (returncode={process.returncode})")
     
     if has_gt:
-        # 读取评估文件
-        expected_output_dir = _project_root / "tracking_evaluation" / video_path.stem / model_type
+        # 读取评估文件（更新后的输出目录结构）
+        expected_output_dir = _project_root / "outputs" / model_type / video_path.stem
         eval_json = expected_output_dir / "evaluation_report.json"
         if eval_json.exists():
             with open(eval_json, 'r', encoding='utf-8') as f:
@@ -211,7 +277,7 @@ def _extract_stats_from_output(stdout: str, stderr: str) -> Dict:
     """从输出文本中提取FPS等统计信息"""
     stats = {}
     combined = (stdout or "") + "\n" + (stderr or "")
-    
+
     # 尝试提取FPS
     fps_patterns = [
         r'FPS[:\s]*([\d.]+)',
@@ -221,7 +287,7 @@ def _extract_stats_from_output(stdout: str, stderr: str) -> Dict:
         r'processing_time[:\s]*([\d.]+)',
         r'total_frames[:\s]*(\d+)',
     ]
-    
+
     for pattern in fps_patterns:
         match = re.search(pattern, combined)
         if match:
@@ -233,13 +299,53 @@ def _extract_stats_from_output(stdout: str, stderr: str) -> Dict:
                 stats['processing_time'] = value
             elif 'total_frames' in pattern.lower():
                 stats['total_frames'] = int(value)
-    
+
     # 如果没找到fps，尝试从 total_frames / processing_time 计算
     if 'fps' not in stats and 'total_frames' in stats and 'processing_time' in stats:
         if stats['processing_time'] > 0:
             stats['fps'] = stats['total_frames'] / stats['processing_time']
-    
+
     return stats
+
+
+def _load_mot_predictions(pred_path: Path) -> Dict:
+    """
+    加载MOT格式的预测结果文件
+
+    MOT格式: <frame>, <id>, <x>, <y>, <w>, <h>, <conf>, <class>, <visibility>
+    转换为 {frame_id: {track_id: [x1, y1, x2, y2]}}
+
+    Args:
+        pred_path: predictions.txt 文件路径
+
+    Returns:
+        {frame_id: {track_id: [x1, y1, x2, y2]}}
+    """
+    from collections import defaultdict
+    predictions = defaultdict(dict)
+
+    if not pred_path.exists():
+        return dict(predictions)
+
+    with open(pred_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split(',')
+            if len(parts) < 6:
+                continue
+
+            frame_id = int(parts[0])  # MOT格式帧号保持原样（1-based），与GT一致
+            track_id = int(parts[1])
+            x = float(parts[2])
+            y = float(parts[3])
+            w = float(parts[4])
+            h = float(parts[5])
+
+            # 转换 (x, y, w, h) -> [x1, y1, x2, y2]
+            predictions[frame_id][track_id] = np.array(
+                [x, y, x + w, y + h], dtype=np.float32
+            )
+
+    return dict(predictions)
 
 
 def main():
@@ -262,8 +368,26 @@ def main():
                         help='KITTI数据集图像目录')
     parser.add_argument('--kitti-seq', type=str, nargs='+', default=['0017', '0019'],
                         help='KITTI序列名称')
+    parser.add_argument('--mot17', action='store_true',
+                        help='使用MOT17数据集模式')
+    parser.add_argument('--mot17-dir', type=str, default='data/MOT17',
+                        help='MOT17数据集根目录')
+    parser.add_argument('--mot17-seq', type=str, nargs='+', default=None,
+                        help='MOT17序列名称（如MOT17-04-FRCNN），不指定则自动发现所有序列')
+    parser.add_argument('--use-hog-api', action="store_true", default=True,
+                        help="传统方法HOG特征提取使用OpenCV API（默认开启）")
+    parser.add_argument('--no-hog-api', action="store_true",
+                        help="传统方法HOG特征提取使用手动实现（非常慢）")
+    parser.add_argument('--use-svm-api', action="store_true", default=True,
+                        help="传统方法SVM使用OpenCV预训练权重（默认开启）")
+    parser.add_argument('--no-svm-api', action="store_true",
+                        help="传统方法SVM不使用OpenCV预训练权重")
 
     args = parser.parse_args()
+
+    # 判断是否使用API
+    use_hog_api = not args.no_hog_api
+    use_svm_api = not args.no_svm_api
 
     # 确定要运行的方法
     if 'all' in args.methods:
@@ -461,11 +585,235 @@ def main():
         print(f"{'='*70}")
         return
 
+    # MOT17数据集模式
+    if args.mot17:
+        mot17_dir = Path(args.mot17_dir)
+        frames = args.frames
+
+        # 自动发现序列
+        if args.mot17_seq:
+            seq_names = args.mot17_seq
+        else:
+            seq_names = sorted([d.name for d in mot17_dir.iterdir()
+                               if d.is_dir() and d.name.startswith('MOT17')])
+            if not seq_names:
+                print(f"[错误] 未在 {mot17_dir} 中找到MOT17序列")
+                return
+            print(f"[信息] 自动发现 {len(seq_names)} 个MOT17序列: {seq_names}")
+
+        for seq_name in seq_names:
+            seq_dir = mot17_dir / seq_name
+            img_dir = seq_dir / "img1"
+            gt_file = seq_dir / "gt" / "gt.txt"
+
+            if not img_dir.exists():
+                print(f"[警告] 图像目录不存在: {img_dir}，跳过")
+                continue
+
+            has_gt = gt_file.exists()
+            if has_gt:
+                print(f"\n[信息] MOT17 {seq_name}: 检测到GT标注")
+            else:
+                print(f"\n[信息] MOT17 {seq_name}: 无GT标注，仅收集FPS/处理时间")
+
+            # 读取 seqinfo.ini 获取图像尺寸
+            seqinfo_path = seq_dir / "seqinfo.ini"
+            img_w, img_h = 1920, 1080  # 默认值
+            if seqinfo_path.exists():
+                with open(seqinfo_path, 'r') as f:
+                    for line in f:
+                        if line.startswith('imWidth'):
+                            img_w = int(line.split('=')[1].strip())
+                        elif line.startswith('imHeight'):
+                            img_h = int(line.split('=')[1].strip())
+
+            # 传统方法
+            if 'traditional' in methods_to_run:
+                trad_output_dir = _project_root / "outputs" / "traditional" / f"seq_{seq_name}"
+                trad_output_dir.mkdir(parents=True, exist_ok=True)
+
+                cmd = [
+                    sys.executable,
+                    str(_project_root / "traditional_method" / "run_traditional.py"),
+                    "--data-dir", str(mot17_dir), "--seq", seq_name,
+                    "--frames", str(frames),
+                ]
+
+                print(f"\n{'='*70}")
+                print(f"  传统方法 (HOG+SVM): {seq_name} {'[有GT]' if has_gt else '[无GT-仅FPS]'}")
+                print(f"{'='*70}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                       encoding='utf-8', errors='replace',
+                                       cwd=_project_root, timeout=600)
+                stats = _extract_stats_from_output(result.stdout, result.stderr)
+
+                if result.returncode != 0:
+                    print(f"[警告] 传统方法运行有错误 (returncode={result.returncode})")
+                    print(result.stderr[-1500:])
+
+                # MOT17 GT评估
+                if has_gt:
+                    from tools.evaluate import TrackingEvaluator
+                    evaluator = TrackingEvaluator(iou_threshold=0.5)
+                    gt = evaluator.load_mot_gt(gt_file, class_ids=[1])
+
+                    pred_file = trad_output_dir / "predictions.txt"
+                    if pred_file.exists():
+                        predictions = _load_mot_predictions(pred_file)
+                        metrics_obj = evaluator.evaluate(predictions, gt)
+                        metrics = metrics_obj.to_dict()
+                        metrics["FPS"] = stats.get("fps", 0.0)
+                        metrics["method"] = "传统方法 (HOG+SVM)"
+                        metrics["scene"] = seq_name
+                        reporter.add_result(metrics["method"], seq_name, metrics)
+                    else:
+                        reporter.add_result("传统方法 (HOG+SVM)", seq_name,
+                            {"method": "传统方法 (HOG+SVM)", "scene": seq_name,
+                             "FPS": stats.get("fps", 0.0), "MOTA": "N/A", "MOTP": "N/A",
+                             "IDF1": "N/A", "IDSW": "N/A", "Precision": "N/A", "Recall": "N/A"})
+                else:
+                    reporter.add_result("传统方法 (HOG+SVM)", seq_name,
+                        {"method": "传统方法 (HOG+SVM)", "scene": seq_name,
+                         "FPS": stats.get("fps", 0.0), "MOTA": "N/A", "MOTP": "N/A"})
+
+            # 深度方法 (预训练)
+            if 'deep_pretrained' in methods_to_run:
+                deep_output_dir = _project_root / "tracking_evaluation" / seq_name / "pretrained"
+                cmd = [
+                    sys.executable,
+                    str(_project_root / "run_tracking_evaluation.py"),
+                    "--images", str(img_dir),
+                    "--model", "pretrained",
+                    "--frames", str(frames),
+                    "--output", str(deep_output_dir),
+                ]
+
+                print(f"\n{'='*70}")
+                print(f"  深度方法 (原始): {seq_name} {'[有GT]' if has_gt else '[无GT-仅FPS]'}")
+                print(f"{'='*70}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                       encoding='utf-8', errors='replace',
+                                       cwd=_project_root, timeout=600)
+                stats = _extract_stats_from_output(result.stdout, result.stderr)
+
+                if result.returncode != 0:
+                    print(f"[警告] 深度方法运行有错误 (returncode={result.returncode})")
+                    print(result.stderr[-1500:])
+
+                if has_gt:
+                    from tools.evaluate import TrackingEvaluator
+                    evaluator = TrackingEvaluator(iou_threshold=0.5)
+                    gt = evaluator.load_mot_gt(gt_file, class_ids=[1])
+
+                    pred_file = deep_output_dir / "predictions.txt"
+                    if pred_file.exists():
+                        predictions = _load_mot_predictions(pred_file)
+                        metrics_obj = evaluator.evaluate(predictions, gt)
+                        metrics = metrics_obj.to_dict()
+                        metrics["FPS"] = stats.get("fps", 0.0)
+                        metrics["method"] = "深度方法 (原始)"
+                        metrics["scene"] = seq_name
+                        reporter.add_result(metrics["method"], seq_name, metrics)
+                    else:
+                        reporter.add_result("深度方法 (原始)", seq_name,
+                            {"method": "深度方法 (原始)", "scene": seq_name,
+                             "FPS": stats.get("fps", 0.0), "MOTA": "N/A", "MOTP": "N/A",
+                             "IDF1": "N/A", "IDSW": "N/A", "Precision": "N/A", "Recall": "N/A"})
+                else:
+                    reporter.add_result("深度方法 (原始)", seq_name,
+                        {"method": "深度方法 (原始)", "scene": seq_name,
+                         "FPS": stats.get("fps", 0.0), "MOTA": "N/A", "MOTP": "N/A"})
+
+            # 深度方法 (微调)
+            if 'deep_custom' in methods_to_run:
+                deep_output_dir = _project_root / "tracking_evaluation" / seq_name / "custom"
+                cmd = [
+                    sys.executable,
+                    str(_project_root / "run_tracking_evaluation.py"),
+                    "--images", str(img_dir),
+                    "--model", "custom",
+                    "--frames", str(frames),
+                    "--output", str(deep_output_dir),
+                ]
+
+                print(f"\n{'='*70}")
+                print(f"  深度方法 (微调): {seq_name} {'[有GT]' if has_gt else '[无GT-仅FPS]'}")
+                print(f"{'='*70}")
+
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                       encoding='utf-8', errors='replace',
+                                       cwd=_project_root, timeout=600)
+                stats = _extract_stats_from_output(result.stdout, result.stderr)
+
+                if result.returncode != 0:
+                    print(f"[警告] 深度方法运行有错误 (returncode={result.returncode})")
+                    print(result.stderr[-1500:])
+
+                deep_output_dir = _project_root / "tracking_evaluation" / seq_name / "custom"
+                if has_gt:
+                    from tools.evaluate import TrackingEvaluator
+                    evaluator = TrackingEvaluator(iou_threshold=0.5)
+                    gt = evaluator.load_mot_gt(gt_file, class_ids=[1])
+
+                    pred_file = deep_output_dir / "predictions.txt"
+                    if pred_file.exists():
+                        predictions = _load_mot_predictions(pred_file)
+                        metrics_obj = evaluator.evaluate(predictions, gt)
+                        metrics = metrics_obj.to_dict()
+                        metrics["FPS"] = stats.get("fps", 0.0)
+                        metrics["method"] = "深度方法 (微调)"
+                        metrics["scene"] = seq_name
+                        reporter.add_result(metrics["method"], seq_name, metrics)
+                    else:
+                        reporter.add_result("深度方法 (微调)", seq_name,
+                            {"method": "深度方法 (微调)", "scene": seq_name,
+                             "FPS": stats.get("fps", 0.0), "MOTA": "N/A", "MOTP": "N/A",
+                             "IDF1": "N/A", "IDSW": "N/A", "Precision": "N/A", "Recall": "N/A"})
+                else:
+                    reporter.add_result("深度方法 (微调)", seq_name,
+                        {"method": "深度方法 (微调)", "scene": seq_name,
+                         "FPS": stats.get("fps", 0.0), "MOTA": "N/A", "MOTP": "N/A"})
+
+        # 生成对比报告（MOT17模式）
+        print(f"\n{'='*70}")
+        print("  生成对比报告")
+        print(f"{'='*70}")
+
+        reporter.save_json_report()
+        csv_path = output_dir / "comparison_table.csv"
+        reporter.generate_table_csv(csv_path)
+        reporter.print_summary()
+
+        markdown_table = reporter.generate_table_markdown()
+        print(f"\n{'='*70}")
+        print("  Markdown 对比表格")
+        print(f"{'='*70}")
+        print(markdown_table)
+
+        md_path = output_dir / "comparison_table.md"
+        md_path.write_text(markdown_table, encoding='utf-8')
+        print(f"\nMarkdown表格已保存: {md_path}")
+
+        print(f"\n所有报告保存至: {output_dir}/")
+        for f in sorted(output_dir.glob("*")):
+            print(f"  - {f.name}")
+
+        print(f"\n{'='*70}")
+        print("  MOT17对比实验完成!")
+        print(f"{'='*70}")
+        return
+
     # 自收集视频模式（原有逻辑）
+    # 计算总任务数
+    total_tasks = len(args.videos_scenes) * len(methods_to_run)
+    pbar = tqdm(total=total_tasks, desc="总体进度", unit="任务", ncols=100)
+    
     for scene_name in args.videos_scenes:
         video_path = CUSTOM_VIDEOS_DIR / f"{scene_name}.mp4"
         if not video_path.exists():
-            print(f"[警告] 视频不存在: {video_path}，跳过")
+            print(f"\n[警告] 视频不存在: {video_path}，跳过")
             continue
         
         has_gt = check_gt_available(scene_name)
@@ -476,16 +824,21 @@ def main():
         
         # 传统方法
         if 'traditional' in methods_to_run:
-            metrics = run_traditional_method(video_path, scene_name, has_gt, args.frames)
+            pbar.set_description(f"处理 {scene_name} - 传统方法")
+            metrics = run_traditional_method(video_path, scene_name, has_gt, args.frames, 
+                                              use_hog_api=use_hog_api,
+                                              use_svm_api=use_svm_api)
             if metrics:
                 reporter.add_result(metrics["method"], scene_name, metrics)
             else:
                 reporter.add_result("传统方法 (HOG+SVM)", scene_name, 
                     {"method": "传统方法 (HOG+SVM)", "scene": scene_name, 
                      "FPS": 0, "MOTA": "FAILED", "MOTP": "FAILED"})
+            pbar.update(1)
         
         # 深度方法 (预训练)
         if 'deep_pretrained' in methods_to_run:
+            pbar.set_description(f"处理 {scene_name} - 深度方法(原始)")
             metrics = run_deep_method(video_path, scene_name, has_gt, args.frames, 'pretrained')
             if metrics:
                 reporter.add_result(metrics["method"], scene_name, metrics)
@@ -493,9 +846,11 @@ def main():
                 reporter.add_result("深度方法 (原始)", scene_name,
                     {"method": "深度方法 (原始)", "scene": scene_name,
                      "FPS": 0, "MOTA": "FAILED", "MOTP": "FAILED"})
+            pbar.update(1)
         
         # 深度方法 (微调)
         if 'deep_custom' in methods_to_run:
+            pbar.set_description(f"处理 {scene_name} - 深度方法(微调)")
             metrics = run_deep_method(video_path, scene_name, has_gt, args.frames, 'custom')
             if metrics:
                 reporter.add_result(metrics["method"], scene_name, metrics)
@@ -503,6 +858,9 @@ def main():
                 reporter.add_result("深度方法 (微调)", scene_name,
                     {"method": "深度方法 (微调)", "scene": scene_name,
                      "FPS": 0, "MOTA": "FAILED", "MOTP": "FAILED"})
+            pbar.update(1)
+    
+    pbar.close()
     
     # 生成对比报告
     print(f"\n{'='*70}")

@@ -58,6 +58,14 @@ def main():
                        help="HOG检测置信度阈值")
     parser.add_argument("--hog-scale", type=float, default=1.05,
                        help="HOG图像金字塔缩放系数(<1.05更精细)")
+    parser.add_argument("--use-hog-api", action="store_true", default=True,
+                       help="HOG特征提取使用OpenCV API（默认开启，速度快）")
+    parser.add_argument("--no-hog-api", action="store_true",
+                       help="HOG特征提取使用手动实现（用于验证算法原理，非常慢）")
+    parser.add_argument("--use-svm-api", action="store_true", default=True,
+                       help="SVM使用OpenCV预训练权重（默认开启）")
+    parser.add_argument("--no-svm-api", action="store_true",
+                       help="SVM不使用OpenCV预训练权重（仅用于标识，决策函数始终手动实现）")
 
     # 跟踪参数
     parser.add_argument("--max-age", type=int, default=30,
@@ -89,6 +97,10 @@ def main():
 
     args = parser.parse_args()
 
+    # 判断是否使用API
+    use_hog_api = not args.no_hog_api
+    use_svm_api = not args.no_svm_api
+
     # 判断输入模式
     use_video_mode = args.video is not None
 
@@ -99,6 +111,8 @@ def main():
     config = TraditionalTrackingConfig(
         hog_conf_threshold=args.hog_conf,
         hog_scale=args.hog_scale,
+        use_hog_api=use_hog_api,
+        use_svm_api=use_svm_api,
         max_age=args.max_age,
         min_hits=args.min_hits,
         iou_threshold=args.iou_threshold,
@@ -113,12 +127,17 @@ def main():
     print("=" * 70)
     print("  动态场景多目标跟踪 - 传统CV方法版")
     print("=" * 70)
-    print(f"  检测:  HOG + SVM (Dalal-Triggs 行人检测器)")
+    print(f"  检测:  HOG ({'OpenCV API' if use_hog_api else '手动实现'}) + SVM ({'预训练权重' if use_svm_api else '手动实现'})")
     print(f"  运动:  {'Farneback 稠密光流' if config.use_optical_flow else '无'}")
     print(f"  跟踪:  卡尔曼滤波 + 级联匹配 + 匈牙利算法")
     print(f"  ReID:  {'颜色直方图 + HOG 特征' if config.use_reid else '无'}")
     print(f"  输入:  {'视频文件' if use_video_mode else '图像序列'}")
     print("=" * 70)
+    
+    if not use_hog_api:
+        print("\n[警告] HOG手动实现模式非常慢，仅用于验证算法原理！")
+        print("       对于1280x720图像，每帧约需处理3600+个窗口。")
+        print("       建议减少处理帧数：--frames 10\n")
 
     total_stats = []
 
@@ -160,10 +179,15 @@ def main():
                 print(f"\n跳过: 序列目录不存在: {seq_dir}")
                 continue
 
+            # 支持MOT17格式：图像在 img1/ 子目录下
+            img_dir = seq_dir
+            if (seq_dir / "img1").is_dir():
+                img_dir = seq_dir / "img1"
+
             output_dir = output_root / f"seq_{seq_name}"
 
             stats = pipeline.process_sequence(
-                image_dir=seq_dir,
+                image_dir=img_dir,
                 output_dir=output_dir,
                 max_frames=args.frames,
                 verbose=True,

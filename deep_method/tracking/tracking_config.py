@@ -50,14 +50,14 @@ class TrackerConfig:
     reid_model: str = 'osnet_x1_0'
     """ReID 模型名称 (osnet_x1_0, osnet_x0_75, resnet50, mobilenet)"""
 
-    appearance_weight: float = 0.4
-    """外观相似度权重"""
+    appearance_weight: float = 0.5
+    """外观相似度权重（主导约束，复杂场景下外观是最可靠的判据）"""
 
-    iou_weight: float = 0.3
-    """IoU 距离权重"""
+    iou_weight: float = 0.2
+    """IoU 距离权重（辅助约束，IoU高时不一定同一人）"""
 
-    mahal_weight: float = 0.3
-    """马氏距离权重"""
+    mahal_weight: float = 0.15
+    """马氏距离权重（辅助约束）"""
 
     feature_smooth_alpha: float = 0.7
     """特征平滑系数（新特征权重）"""
@@ -66,8 +66,8 @@ class TrackerConfig:
     use_social_constraint: bool = True
     """是否启用社会行为约束"""
 
-    social_weight: float = 0.2
-    """社会行为代价权重"""
+    social_weight: float = 0.1
+    """社会行为代价权重（辅助约束）"""
 
     overlap_threshold: float = 0.3
     """重叠惩罚阈值"""
@@ -85,6 +85,52 @@ class TrackerConfig:
     # ==================== 马氏距离门控 ====================
     gating_threshold: float = 9.4877
     """马氏距离门控阈值（卡方分布 95% 置信度）"""
+
+    # ==================== 运动一致性约束（含伪三维扩展） ====================
+    motion_consistency_weight: float = 0.15
+    """运动一致性代价权重（辅助约束，外观为主时运动仅作辅助验证）"""
+
+    motion_speed_threshold: float = 1.0
+    """静止目标速度阈值（像素/帧），低于此值视为静止，不检查方向和速度"""
+
+    motion_displacement_threshold: float = 2.0
+    """最小位移阈值（像素），低于此值不检查方向"""
+
+    motion_ema_alpha: float = 0.4
+    """速度EMA平滑系数（新速度权重），值越大越跟踪最新速度，越小越平滑"""
+
+    # ==================== 伪三维深度约束 ====================
+    pseudo_3d_scale_threshold: float = 0.02
+    """尺度变化率阈值，低于此值视为无深度方向运动，退化为纯2D检查"""
+
+    pseudo_3d_direction_weight: float = 0.5
+    """伪三维方向一致性在3D代价中的权重（0~1，剩余给速度一致性）"""
+
+    pseudo_3d_new_track_frames: int = 3
+    """新轨迹（hits <= 此值）不检查伪三维深度约束"""
+
+    pseudo_3d_lost_frames: int = 5
+    """丢失超过此帧数后，深度约束大幅降权"""
+
+    pseudo_3d_depth_cost_weight: float = 0.3
+    """深度方向矛盾在3D代价中的权重"""
+
+    # ==================== 尺度一致性约束 ====================
+    scale_weight: float = 0.15
+    """尺度一致性代价权重（辅助约束），设为0禁用"""
+
+    # ==================== 非线性惩罚参数 ====================
+    nonlinear_penalty_enabled: bool = True
+    """是否启用非线性惩罚（变化越大惩罚越大）"""
+
+    nonlinear_gentle_slope: float = 0.3
+    """非线性惩罚中等区间斜率（二次项系数，控制温和区间增长速度）"""
+
+    nonlinear_steep_slope: float = 1.5
+    """非线性惩罚大偏差区间斜率（指数项系数，控制大偏差惩罚陡峭程度）"""
+
+    nonlinear_transition: float = 1.0
+    """非线性惩罚从二次到指数的过渡点（归一化偏差值）"""
 
     # ==================== 类别特定参数 ====================
     class_specific_params: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
@@ -139,20 +185,23 @@ class ConfigPresets:
 
     @staticmethod
     def standard() -> TrackerConfig:
-        """标准模式 - 平衡速度和精度，优化减少ID切换"""
+        """标准模式 - 外观为主导，空间/运动为辅助"""
         return TrackerConfig(
-            max_age=50,  # 增大存活期，遮挡后更易恢复
+            max_age=50,
             min_hits=3,
             iou_threshold=0.3,
             use_bytetrack=True,
             use_reid=True,
             reid_model='osnet_x1_0',
-            appearance_weight=0.5,  # 提高外观权重，增强ReID匹配
-            iou_weight=0.3,
-            mahal_weight=0.2,
-            feature_smooth_alpha=0.3,  # EMA平滑系数（低值=历史特征权重70%=更稳定）
+            appearance_weight=0.5,
+            iou_weight=0.2,
+            mahal_weight=0.15,
+            feature_smooth_alpha=0.3,
             use_social_constraint=True,
-            use_adaptive=False,  # 禁用自适应，保持参数稳定
+            social_weight=0.1,
+            motion_consistency_weight=0.15,
+            scale_weight=0.15,
+            use_adaptive=False,
         )
 
     @staticmethod

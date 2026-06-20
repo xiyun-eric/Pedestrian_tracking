@@ -78,6 +78,7 @@ def create_tracker(
     reid_model: str = 'osnet_x1_0',
     device: str = 'cuda:0',
     use_torchreid: bool = True,
+    use_finetuned_reid: bool = False,
 ) -> AdvancedTracker:
     """
     快速创建跟踪器
@@ -89,6 +90,7 @@ def create_tracker(
         reid_model: ReID 模型名称 (osnet_x1_0推荐，有MSMT17预训练权重)
         device: 设备
         use_torchreid: 是否使用torchreid库（True=使用OSNet，False=使用torchvision ResNet50）
+        use_finetuned_reid: 是否使用 LoRA 微调后的 ReID 权重（优先加载 runs/reid/osnet_lora/）
     
     Returns:
         跟踪器实例
@@ -116,6 +118,20 @@ def create_tracker(
         density_threshold_high=tracker_config.density_threshold_high,
         density_threshold_low=tracker_config.density_threshold_low,
         gating_threshold=tracker_config.gating_threshold,
+        motion_consistency_weight=tracker_config.motion_consistency_weight,
+        motion_speed_threshold=tracker_config.motion_speed_threshold,
+        motion_displacement_threshold=tracker_config.motion_displacement_threshold,
+        motion_ema_alpha=tracker_config.motion_ema_alpha,
+        pseudo_3d_scale_threshold=tracker_config.pseudo_3d_scale_threshold,
+        pseudo_3d_direction_weight=tracker_config.pseudo_3d_direction_weight,
+        pseudo_3d_new_track_frames=tracker_config.pseudo_3d_new_track_frames,
+        pseudo_3d_lost_frames=tracker_config.pseudo_3d_lost_frames,
+        pseudo_3d_depth_cost_weight=tracker_config.pseudo_3d_depth_cost_weight,
+        scale_weight=tracker_config.scale_weight,
+        nonlinear_penalty_enabled=tracker_config.nonlinear_penalty_enabled,
+        nonlinear_gentle_slope=tracker_config.nonlinear_gentle_slope,
+        nonlinear_steep_slope=tracker_config.nonlinear_steep_slope,
+        nonlinear_transition=tracker_config.nonlinear_transition,
         scene_type=tracker_config.scene_type,
         camera_motion=tracker_config.camera_motion,
         output_trajectory=tracker_config.output_trajectory,
@@ -130,6 +146,7 @@ def create_tracker(
             device=device,
             use_torchreid=use_torchreid,
             smooth_alpha=tracker_config.feature_smooth_alpha,
+            use_finetuned=use_finetuned_reid,
         )
         tracker.set_reid_extractor(reid)
     return tracker

@@ -21,6 +21,10 @@ class KalmanFilter:
     - (vx, vy, vw, vh): 对应的速度
 
     观测向量: [x, y, w, h]
+    
+    自适应特性:
+    - 当轨迹连续未匹配时，自动增大过程噪声，
+      使协方差膨胀，扩大搜索范围，提高重新匹配概率
     """
 
     def __init__(
@@ -68,6 +72,40 @@ class KalmanFilter:
         self.R[1, 1] = self.position_noise
         self.R[2, 2] = self.position_noise * 2
         self.R[3, 3] = self.position_noise * 2
+        
+        # 保存基础噪声矩阵，用于自适应缩放
+        self._base_Q = self.Q.copy()
+
+    def get_adaptive_Q(self, time_since_update: int) -> np.ndarray:
+        """
+        获取自适应过程噪声矩阵
+        
+        当轨迹连续未匹配时，增大过程噪声使协方差膨胀，
+        扩大搜索范围，提高重新匹配概率。
+        
+        Args:
+            time_since_update: 自上次更新以来的帧数
+        
+        Returns:
+            自适应后的过程噪声矩阵
+        """
+        if time_since_update <= 1:
+            return self._base_Q.copy()
+        
+        # 温和增长因子：避免过度膨胀导致框跑飞或不断放大
+        scale = min(1.0 + 0.2 * (time_since_update - 1), 3.0)
+        
+        adaptive_Q = self._base_Q.copy()
+        # 位置噪声适度增长
+        adaptive_Q[0, 0] *= scale
+        adaptive_Q[1, 1] *= scale
+        # 速度噪声适度增长（不再使用1.5倍额外缩放）
+        adaptive_Q[4, 4] *= scale
+        adaptive_Q[5, 5] *= scale
+        # 宽高噪声不增长，防止框不断放大
+        # Q[2,2] 和 Q[3,3] 保持不变
+        
+        return adaptive_Q
 
     def initiate(self, measurement: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -102,6 +140,31 @@ class KalmanFilter:
         """
         predicted_mean = self.F @ mean
         predicted_covariance = self.F @ covariance @ self.F.T + self.Q
+
+        predicted_mean[2] = np.maximum(predicted_mean[2], 1.0)
+        predicted_mean[3] = np.maximum(predicted_mean[3], 1.0)
+
+        return predicted_mean, predicted_covariance
+
+    def predict_with_Q(
+        self, mean: np.ndarray, covariance: np.ndarray, Q: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        使用自定义过程噪声矩阵预测下一状态
+        
+        用于自适应卡尔曼滤波：当轨迹连续未匹配时，
+        使用增大的过程噪声使协方差膨胀，扩大搜索范围。
+        
+        Args:
+            mean: 当前状态均值
+            covariance: 当前状态协方差
+            Q: 自定义过程噪声矩阵
+        
+        Returns:
+            (predicted_mean, predicted_covariance)
+        """
+        predicted_mean = self.F @ mean
+        predicted_covariance = self.F @ covariance @ self.F.T + Q
 
         predicted_mean[2] = np.maximum(predicted_mean[2], 1.0)
         predicted_mean[3] = np.maximum(predicted_mean[3], 1.0)

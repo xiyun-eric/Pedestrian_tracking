@@ -20,7 +20,9 @@
 """
 
 import sys
+import time
 from pathlib import Path
+from tqdm import tqdm
 
 # 添加 common 模块路径
 _project_root = Path(__file__).resolve().parents[1]
@@ -49,10 +51,12 @@ class TraditionalTrackingConfig:
     # 检测参数
     hog_win_stride: Tuple[int, int] = (8, 8)
     hog_scale: float = 1.05
-    hog_conf_threshold: float = 0.3
+    hog_conf_threshold: float = 0.3  # 置信度阈值（平衡召回率与精确率）
+    use_hog_api: bool = True         # HOG特征提取是否使用OpenCV API（默认True，速度快）
+    use_svm_api: bool = True         # SVM是否使用OpenCV预训练权重（默认True）
     
     # 跟踪参数
-    max_age: int = 30             # 轨迹最大丢失帧数
+    max_age: int = 15             # 轨迹最大丢失帧数（缩短以减少幽灵框）
     min_hits: int = 3             # 确认轨迹所需最小检测数
     iou_threshold: float = 0.3    # IoU 匹配阈值
     
@@ -62,6 +66,7 @@ class TraditionalTrackingConfig:
     flow_levels: int = 3
     flow_winsize: int = 15
     flow_iterations: int = 3
+    flow_correction_weight: float = 0.5  # 光流校正权重（增大以更好应对变速运动）
     
     # ReID参数
     use_reid: bool = True
@@ -195,6 +200,8 @@ class TraditionalTrackingPipeline:
             win_stride=self.config.hog_win_stride,
             scale=self.config.hog_scale,
             conf_threshold=self.config.hog_conf_threshold,
+            use_hog_api=self.config.use_hog_api,
+            use_svm_api=self.config.use_svm_api,
         )
         
         self.flow_estimator = OpticalFlowEstimator(
@@ -208,11 +215,12 @@ class TraditionalTrackingPipeline:
             iou_threshold=self.config.iou_threshold,
             max_age=self.config.max_age,
             min_hits=self.config.min_hits,
+            flow_correction_weight=self.config.flow_correction_weight,
         )
         
         if self.config.use_reid:
             feat_config = FeatureConfig()
-            self.feature_extractor = FeatureExtractor(feat_config)
+            self.feature_extractor = FeatureExtractor(feat_config, use_opencv_api=self.config.use_hog_api)
             self.reid_matcher = ReIDMatcher(
                 self.feature_extractor,
                 high_threshold=self.config.reid_high_threshold,
@@ -277,6 +285,10 @@ class TraditionalTrackingPipeline:
             "processing_time": 0.0,
         }
         
+        # 评估数据收集
+        eval_predictions = {}
+        eval_confidences = {}
+        
         print(f"\n{'='*60}")
         print(f"传统CV方法跟踪: {image_dir.name}")
         print(f"总帧数: {len(frame_files)}, 图像尺寸: {w}x{h}")
@@ -300,17 +312,34 @@ class TraditionalTrackingPipeline:
                 flow = self.flow_estimator.compute(gray)
             else:
                 flow = None
-            
+
+            # === 步骤2.5: 光流校正 — 用光流位移修正卡尔曼预测 ===
+            flow_corrections = None
+            if flow is not None and self.config.flow_correction_weight > 0:
+                flow_corrections = {}
+                for track in self.tracker.tracks:
+                    if not track.is_deleted:
+                        bbox = track.get_bbox()
+                        dx, dy = self.flow_estimator.get_bbox_motion(flow, bbox)
+                        flow_corrections[track.track_id] = (dx, dy)
+
             # === 步骤3: 卡尔曼滤波跟踪 ===
             if len(detections) > 0:
-                confirmed_tracks = self.tracker.update(detections, confidences=confidences)
+                confirmed_tracks = self.tracker.update(detections, confidences=confidences, flow_corrections=flow_corrections)
             else:
                 # 空检测时仍然更新（预测状态并衰减轨迹）
                 empty_dets = np.zeros((0, 4), dtype=np.float32)
                 empty_confs = np.zeros((0,), dtype=np.float32)
-                confirmed_tracks = self.tracker.update(empty_dets, confidences=empty_confs)
+                confirmed_tracks = self.tracker.update(empty_dets, confidences=empty_confs, flow_corrections=flow_corrections)
             
             stats["max_tracks"] = max(stats["max_tracks"], len(confirmed_tracks))
+            
+            # 评估数据收集
+            for track in confirmed_tracks:
+                tid = track.track_id
+                bbox = track.get_bbox()
+                eval_predictions.setdefault(frame_idx, {})[tid] = bbox.copy()
+                eval_confidences.setdefault(frame_idx, {})[tid] = getattr(track, 'confidence', 0.5)
             
             # === 步骤4: ReID 特征提取与注册 ===
             if self.config.use_reid and len(confirmed_tracks) > 0:
@@ -383,6 +412,12 @@ class TraditionalTrackingPipeline:
         
         if video_writer:
             video_writer.release()
+        
+        # 保存MOT格式预测结果，供外部评估使用
+        if eval_predictions:
+            from tools.evaluate import TrackingEvaluator as _Eval
+            _eval = _Eval()
+            _eval.save_predictions_mot(eval_predictions, str(output_dir / "predictions.txt"), eval_confidences)
         
         avg_fps = len(frame_files) / stats["processing_time"]
         print(f"\n完成! 平均 FPS: {avg_fps:.1f}")
@@ -461,7 +496,9 @@ class TraditionalTrackingPipeline:
 
         visualizer = TrackingVisualizer()
 
-        for frame_idx in range(max_frames):
+        # 使用 tqdm 进度条
+        pbar = tqdm(range(max_frames), desc="处理进度", unit="帧", ncols=100)
+        for frame_idx in pbar:
             ret, frame = cap.read()
             if not ret:
                 break
@@ -480,23 +517,32 @@ class TraditionalTrackingPipeline:
             else:
                 flow = None
 
+            # 光流校正 — 用光流位移修正卡尔曼预测
+            flow_corrections = None
+            if flow is not None and self.config.flow_correction_weight > 0:
+                flow_corrections = {}
+                for track in self.tracker.tracks:
+                    if not track.is_deleted:
+                        bbox = track.get_bbox()
+                        dx, dy = self.flow_estimator.get_bbox_motion(flow, bbox)
+                        flow_corrections[track.track_id] = (dx, dy)
+
             # 卡尔曼滤波跟踪
             if len(detections) > 0:
-                confirmed_tracks = self.tracker.update(detections, confidences=confidences)
+                confirmed_tracks = self.tracker.update(detections, confidences=confidences, flow_corrections=flow_corrections)
             else:
                 empty_dets = np.zeros((0, 4), dtype=np.float32)
                 empty_confs = np.zeros((0,), dtype=np.float32)
-                confirmed_tracks = self.tracker.update(empty_dets, confidences=empty_confs)
+                confirmed_tracks = self.tracker.update(empty_dets, confidences=empty_confs, flow_corrections=flow_corrections)
 
             stats["max_tracks"] = max(stats["max_tracks"], len(confirmed_tracks))
 
-            # 评估数据收集
-            if eval_gt:
-                for track in confirmed_tracks:
-                    tid = track.track_id
-                    bbox = track.get_bbox()
-                    eval_predictions.setdefault(frame_idx, {})[tid] = bbox.copy()
-                    eval_confidences.setdefault(frame_idx, {})[tid] = getattr(track, 'confidence', 0.5)
+            # 评估数据收集（始终收集，供外部评估使用）
+            for track in confirmed_tracks:
+                tid = track.track_id
+                bbox = track.get_bbox()
+                eval_predictions.setdefault(frame_idx, {})[tid] = bbox.copy()
+                eval_confidences.setdefault(frame_idx, {})[tid] = getattr(track, 'confidence', 0.5)
 
             # ReID 特征提取与注册
             if self.config.use_reid and len(confirmed_tracks) > 0:
@@ -554,12 +600,14 @@ class TraditionalTrackingPipeline:
             stats["total_frames"] += 1
             stats["processing_time"] += time.time() - t_start
 
-            if verbose and (frame_idx + 1) % 20 == 0:
-                current_fps = (frame_idx + 1) / stats["processing_time"]
-                print(f"  帧 {frame_idx+1}/{max_frames} | "
-                      f"检测: {len(detections)} | 跟踪: {len(confirmed_tracks)} | "
-                      f"FPS: {current_fps:.1f}")
+            # 更新进度条信息
+            pbar.set_postfix({
+                "检测": len(detections),
+                "跟踪": len(confirmed_tracks),
+                "FPS": f"{(frame_idx + 1) / max(0.001, stats['processing_time']):.1f}"
+            })
 
+        pbar.close()
         cap.release()
         if video_writer:
             video_writer.release()
@@ -608,6 +656,12 @@ class TraditionalTrackingPipeline:
                 print(f"警告: 未找到GT标注 (scene={scene_name})")
         elif eval_gt:
             print("\n[警告] 启用了评估但未提供GT标注目录 (--labels)")
+
+        # 无条件保存MOT格式预测结果，供外部评估使用
+        if eval_predictions:
+            from tools.evaluate import TrackingEvaluator as _Eval
+            _eval = _Eval()
+            _eval.save_predictions_mot(eval_predictions, str(output_dir / "predictions.txt"), eval_confidences)
 
         avg_fps = stats["total_frames"] / max(stats["processing_time"], 0.001)
         print(f"\n完成! 平均 FPS: {avg_fps:.1f}")

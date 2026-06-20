@@ -67,12 +67,49 @@ class Track:
         self.track_state = TrackState.TENTATIVE
 
         self._class_id = 0
+        
+        # 记录初始宽高作为尺寸参考基准
+        init_w = detection[2] - detection[0]
+        init_h = detection[3] - detection[1]
+        self._ref_w = init_w
+        self._ref_h = init_h
+        self._ref_count = 1
 
     def predict(self):
-        """预测下一帧的状态"""
-        self.mean, self.covariance = self.kf.predict(self.mean, self.covariance)
+        """预测下一帧的状态（使用自适应过程噪声）"""
+        # 保存预测前的宽高，用于约束
+        prev_w = self.mean[2]
+        prev_h = self.mean[3]
+        
+        # 抑制速度分量漂移：
+        # vw/vh 强衰减：行人尺寸帧间变化极小
+        self.mean[6] *= 0.1  # vw 衰减
+        self.mean[7] *= 0.1  # vh 衰减
+        # vx/vy 温和衰减：未匹配时速度不确定性增大，防止预测位置漂移
+        # 已匹配时(time_since_update==0)保留速度，未匹配时逐渐衰减
+        if self.time_since_update > 0:
+            self.mean[4] *= 0.7  # vx 衰减
+            self.mean[5] *= 0.7  # vy 衰减
+        
+        # 使用自适应过程噪声：未匹配帧数越多，噪声越大，搜索范围越广
+        adaptive_Q = self.kf.get_adaptive_Q(self.time_since_update)
+        self.mean, self.covariance = self.kf.predict_with_Q(
+            self.mean, self.covariance, adaptive_Q
+        )
         self.age += 1
         self.time_since_update += 1
+
+        # 宽高约束：预测后宽高不能突变（每帧最多变化5%）
+        max_change = 1.05
+        min_change = 0.95
+        self.mean[2] = np.clip(self.mean[2], prev_w * min_change, prev_w * max_change)
+        self.mean[3] = np.clip(self.mean[3], prev_h * min_change, prev_h * max_change)
+        
+        # 基于历史参考尺寸的硬约束：宽高不能超过参考尺寸的2倍，不能低于0.4倍
+        ref_w = self._ref_w / self._ref_count
+        ref_h = self._ref_h / self._ref_count
+        self.mean[2] = np.clip(self.mean[2], ref_w * 0.4, ref_w * 2.0)
+        self.mean[3] = np.clip(self.mean[3], ref_h * 0.4, ref_h * 2.0)
 
         w = self.mean[2]
         h = self.mean[3]
@@ -93,11 +130,46 @@ class Track:
         """
         z = KalmanFilter.bbox_to_z(detection)
         self.mean, self.covariance = self.kf.update(self.mean, self.covariance, z)
+        
+        # 抑制宽高速度分量：防止卡尔曼增益给vw/vh分配过大值
+        self.mean[6] *= 0.1  # vw 衰减
+        self.mean[7] *= 0.1  # vh 衰减
+
+        # 宽高约束：更新后宽高不能突变（每帧最多变化10%）
+        if len(self.history) > 0:
+            prev_bbox = self.history[-1]
+            prev_w = prev_bbox[2] - prev_bbox[0]
+            prev_h = prev_bbox[3] - prev_bbox[1]
+            
+            cur_w = self.mean[2]
+            cur_h = self.mean[3]
+            
+            min_w = prev_w * 0.9
+            max_w = prev_w * 1.1
+            min_h = prev_h * 0.9
+            max_h = prev_h * 1.1
+            
+            self.mean[2] = np.clip(cur_w, min_w, max_w)
+            self.mean[3] = np.clip(cur_h, min_h, max_h)
+        
+        # 基于历史参考尺寸的硬约束
+        ref_w = self._ref_w / self._ref_count
+        ref_h = self._ref_h / self._ref_count
+        self.mean[2] = np.clip(self.mean[2], ref_w * 0.4, ref_w * 2.0)
+        self.mean[3] = np.clip(self.mean[3], ref_h * 0.4, ref_h * 2.0)
 
         self.hits += 1
         self.time_since_update = 0
         self.confidence = confidence
         self.history.append(detection.copy())
+        
+        # 更新参考尺寸：用指数移动平均平滑
+        det_w = detection[2] - detection[0]
+        det_h = detection[3] - detection[1]
+        alpha = 0.3  # 新检测权重
+        self._ref_w = self._ref_w * (1 - alpha) + det_w * alpha
+        self._ref_h = self._ref_h * (1 - alpha) + det_h * alpha
+        self._ref_count = 1  # ref_w/ref_h 已经是加权平均，不需要除以count
 
         if self.track_state == TrackState.TENTATIVE and self.hits >= 2:
             self.track_state = TrackState.CONFIRMED
@@ -169,22 +241,26 @@ class Tracker:
     def __init__(
         self,
         iou_threshold: float = 0.3,
-        max_age: int = 30,
+        max_age: int = 15,
         min_hits: int = 2,
         max_iou_distance: float = 0.7,
-        max_age_unmatched: int = 30,
+        max_age_unmatched: int = 15,
         lambda_iou: float = 0.5,
+        flow_correction_weight: float = 0.3,
+        tentative_tolerance: int = 2,
     ):
         """
         初始化跟踪器
 
         Args:
             iou_threshold: IoU匹配阈值
-            max_age: 轨迹最大存活帧数
+            max_age: 轨迹最大丢失帧数（超过后删除）
             min_hits: 确认轨迹所需的最小检测次数
             max_iou_distance: 最大IoU距离
-            max_age_unmatched: 未匹配轨迹最大存活帧数
+            max_age_unmatched: 未匹配轨迹最大存活帧数（级联匹配范围）
             lambda_iou: IoU距离权重（马氏距离权重为1-lambda_iou）
+            flow_correction_weight: 光流校正权重（0=不校正，1=完全信任光流）
+            tentative_tolerance: TENTATIVE轨迹容忍帧数（未匹配多少帧后才删除）
         """
         self.iou_threshold = iou_threshold
         self.max_age = max_age
@@ -192,6 +268,8 @@ class Tracker:
         self.max_iou_distance = max_iou_distance
         self.max_age_unmatched = max_age_unmatched
         self.lambda_iou = lambda_iou
+        self.flow_correction_weight = flow_correction_weight
+        self.tentative_tolerance = tentative_tolerance
 
         self.tracks: List[Track] = []
         self.frame_count = 0
@@ -203,6 +281,7 @@ class Tracker:
         detections: np.ndarray,
         confidences: Optional[np.ndarray] = None,
         class_ids: Optional[np.ndarray] = None,
+        flow_corrections: Optional[Dict[int, Tuple[float, float]]] = None,
     ) -> List[Track]:
         """
         更新跟踪器
@@ -211,6 +290,7 @@ class Tracker:
             detections: (N, 4) 边界框数组 [x1, y1, x2, y2]
             confidences: (N,) 置信度数组
             class_ids: (N,) 类别ID数组
+            flow_corrections: 光流校正字典 {track_id: (dx, dy)}
 
         Returns:
             当前帧确认的轨迹列表
@@ -226,8 +306,44 @@ class Tracker:
         if class_ids is None:
             class_ids = np.zeros(len(detections), dtype=np.int32)
 
+        # 记录每个轨迹在predict之前是否刚被匹配（time_since_update==0）
+        # 用于光流校正判断：只有上一帧未匹配的轨迹才需要光流校正
+        was_matched = {}
+        for track in self.tracks:
+            was_matched[track.track_id] = (track.time_since_update == 0)
+
         for track in self.tracks:
             track.predict()
+
+        # 光流校正：仅对上一帧未匹配的轨迹使用
+        # 上一帧已匹配的轨迹由检测框直接更新，不需要光流校正
+        if flow_corrections and self.flow_correction_weight > 0:
+            for track in self.tracks:
+                if track.track_id not in flow_corrections or track.is_deleted:
+                    continue
+                # 只有上一帧未匹配的轨迹才用光流校正
+                if was_matched.get(track.track_id, False):
+                    continue
+                
+                dx, dy = flow_corrections[track.track_id]
+                
+                # 保守的光流校正权重
+                adaptive_weight = min(
+                    self.flow_correction_weight * 0.5,
+                    0.2
+                )
+                
+                # 计算光流位移
+                correction_x = dx * adaptive_weight
+                correction_y = dy * adaptive_weight
+                
+                # 限制单次校正幅度
+                max_correction = 5.0
+                correction_x = np.clip(correction_x, -max_correction, max_correction)
+                correction_y = np.clip(correction_y, -max_correction, max_correction)
+                
+                track.mean[0] += correction_x
+                track.mean[1] += correction_y
 
         matched, unmatched_detections, unmatched_tracks = self._cascade_associate(
             detections, confidences
@@ -239,21 +355,114 @@ class Tracker:
                 confidences[det_idx],
             )
 
+        # 渐进式删除：TENTATIVE容忍若干帧未匹配，CONFIRMED超过max_age才删除
         for track_idx in unmatched_tracks:
-            self.tracks[track_idx].mark_missed()
+            track = self.tracks[track_idx]
+            if track.is_tentative and track.time_since_update > self.tentative_tolerance:
+                track.mark_missed()
+            elif track.is_confirmed and track.time_since_update > self.max_age:
+                track.mark_missed()
 
         for det_idx in unmatched_detections:
-            new_track = Track(
-                detections[det_idx],
-                confidences[det_idx],
-            )
-            self.tracks.append(new_track)
+            det = detections[det_idx]
+            # 检查该检测是否与已有轨迹高度重叠或位于交汇区域
+            # 如果重叠，说明是融合框、重复检测或交汇虚假框，不应创建新轨迹
+            is_invalid = False
+            det_area = max((det[2] - det[0]) * (det[3] - det[1]), 1.0)
+            det_cx = (det[0] + det[2]) / 2
+            det_cy = (det[1] + det[3]) / 2
+            
+            for track in self.tracks:
+                if track.is_deleted:
+                    continue
+                track_bbox = track.get_bbox()
+                track_area = max((track_bbox[2] - track_bbox[0]) * (track_bbox[3] - track_bbox[1]), 1.0)
+                iou = self._compute_iou(track_bbox, det)
+                
+                # 条件1：与已有轨迹IoU过高，且面积差异不大（正常重叠）
+                # 但如果轨迹框异常大（面积>检测3倍），不应抑制新检测
+                if iou > 0.3 and track_area < det_area * 3.0:
+                    is_invalid = True
+                    break
+                
+                # 条件2：检测框中心在已有轨迹内部，且面积差异大
+                if (track_bbox[0] <= det_cx <= track_bbox[2] and
+                    track_bbox[1] <= det_cy <= track_bbox[3]):
+                    area_ratio = det_area / track_area
+                    # 只有当轨迹大小合理时才抑制
+                    if 0.5 <= area_ratio <= 2.0:
+                        is_invalid = True
+                        break
+            
+            # 条件3：检测框与多个轨迹都有中等重叠（交汇区域特征）
+            if not is_invalid and len(self.tracks) > 1:
+                overlap_count = 0
+                for track in self.tracks:
+                    if track.is_deleted:
+                        continue
+                    track_bbox = track.get_bbox()
+                    iou = self._compute_iou(track_bbox, det)
+                    if iou > 0.1:
+                        overlap_count += 1
+                if overlap_count >= 2:
+                    is_invalid = True
+            
+            if not is_invalid:
+                new_track = Track(
+                    det,
+                    confidences[det_idx],
+                )
+                self.tracks.append(new_track)
 
         self.tracks = [t for t in self.tracks if not t.is_deleted]
 
-        confirmed_tracks = [t for t in self.tracks if t.is_confirmed]
+        # 重复轨迹合并：同一目标不应被多条轨迹跟踪
+        self._merge_duplicate_tracks()
 
-        return confirmed_tracks
+        # 只返回当前帧有检测匹配的轨迹（time_since_update == 0）
+        # 未匹配的轨迹仅在内部保留，用于后续帧的重匹配，不参与可视化
+        # 这是防止"幽灵框"的关键：没有检测支撑的轨迹不应被显示
+        active_tracks = [t for t in self.tracks if t.is_confirmed and t.time_since_update == 0]
+
+        return active_tracks
+
+    def _merge_duplicate_tracks(self):
+        """
+        合并重复轨迹：当多个轨迹的预测框高度重叠时，
+        保留置信度最高（hits最多）的轨迹，删除其余轨迹。
+        
+        这解决了 HOG 检测器对同一目标产生多个检测框，
+        导致多条轨迹跟踪同一目标的问题。
+        """
+        if len(self.tracks) < 2:
+            return
+
+        # 计算所有轨迹对之间的 IoU
+        n = len(self.tracks)
+        to_remove = set()
+
+        for i in range(n):
+            if i in to_remove:
+                continue
+            for j in range(i + 1, n):
+                if j in to_remove:
+                    continue
+
+                bbox_i = self.tracks[i].get_bbox()
+                bbox_j = self.tracks[j].get_bbox()
+                iou = self._compute_iou(bbox_i, bbox_j)
+
+                # IoU > 0.5 认为是同一目标的重复轨迹
+                if iou > 0.5:
+                    # 保留 hits 更多的轨迹（更稳定）
+                    if self.tracks[i].hits >= self.tracks[j].hits:
+                        to_remove.add(j)
+                    else:
+                        to_remove.add(i)
+                        break  # i 被删除，不需要再比较
+
+        if to_remove:
+            self.tracks = [t for idx, t in enumerate(self.tracks) if idx not in to_remove]
 
     def _cascade_associate(
         self,
@@ -351,6 +560,21 @@ class Tracker:
                         self.lambda_iou * iou_dist +
                         (1 - self.lambda_iou) * (mahal_dist / self._gating_threshold)
                     )
+
+                    # 尺寸一致性惩罚：防止融合大框匹配到单人轨迹
+                    track_w = track_bbox[2] - track_bbox[0]
+                    track_h = track_bbox[3] - track_bbox[1]
+                    det_w = det[2] - det[0]
+                    det_h = det[3] - det[1]
+                    track_area = max(track_w * track_h, 1.0)
+                    det_area = max(det_w * det_h, 1.0)
+                    area_ratio = det_area / track_area
+                    # 检测框面积超过轨迹2倍时，很可能是融合框，增加惩罚
+                    if area_ratio > 2.0:
+                        base_cost += min(1.0, (area_ratio - 2.0) * 0.5)
+                    # 检测框面积不到轨迹一半时，也不太合理
+                    elif area_ratio < 0.5:
+                        base_cost += min(1.0, (0.5 - area_ratio) * 0.3)
 
                     track_cx = (track_bbox[0] + track_bbox[2]) / 2
                     track_cy = (track_bbox[1] + track_bbox[3]) / 2

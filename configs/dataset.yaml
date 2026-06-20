@@ -1,12 +1,13 @@
 # 自采集行人跟踪数据集配置
-# 用于 YOLO11 LoRA 微调
+# 用于 YO11 微调/LoRA微调
+# 需先运行: python tools/prepare_data.py --input data/custom --output data/yolo_custom
 
 # 数据集路径
-path: ../data/custom
+path: D:/学习/大创/Pedestrian_tracking/data/yolo_custom
 
 # 训练/验证集
-train: images  # 所有场景的 train 目录
-val: images    # 所有场景的 val 目录
+train: images/train
+val: images/val
 
 # 类别定义
 names:
@@ -14,20 +15,3 @@ names:
   1: cyclist     # 骑车人
   2: car         # 车辆
   3: other       # 其他
-
-# 数据集统计 (供参考)
-# 总图像数: 3841
-# 总标注框数: 12895
-# 类别分布:
-#   pedestrian: 10561 (82%)
-#   cyclist: 1576 (12%)
-#   car: 758 (6%)
-# 平均每帧框数: 3.36
-
-# 场景列表
-scenes:
-  - scene1  # 校园场景
-  - scene2  # 操场场景
-  - scene3  # 路口场景 (多类别)
-  - scene4  # 教室场景
-  - scene5  # 食堂场景

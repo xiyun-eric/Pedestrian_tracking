@@ -133,6 +133,7 @@ class TrackingEvaluator:
         self,
         predictions: Dict[int, Dict[int, np.ndarray]],
         ground_truth: Dict[int, Dict[int, np.ndarray]],
+        eval_mode: str = "prediction_range",
     ) -> TrackingMetrics:
         """
         评估跟踪性能
@@ -140,13 +141,23 @@ class TrackingEvaluator:
         Args:
             predictions: {frame_id: {track_id: [x1,y1,x2,y2]}}
             ground_truth: {frame_id: {obj_id: [x1,y1,x2,y2]}}
+            eval_mode: 评估模式
+                - "prediction_range": 只评估有预测的帧（默认，适用于部分帧评估）
+                - "all": 评估所有帧（适用于完整序列评估）
 
         Returns:
             TrackingMetrics
         """
         metrics = TrackingMetrics()
 
-        all_frames = sorted(set(list(predictions.keys()) + list(ground_truth.keys())))
+        # 根据评估模式确定帧范围
+        if eval_mode == "prediction_range":
+            # 只评估有预测的帧
+            all_frames = sorted(predictions.keys())
+        else:
+            # 评估所有帧（预测+GT的并集）
+            all_frames = sorted(set(list(predictions.keys()) + list(ground_truth.keys())))
+
         metrics.num_frames = len(all_frames)
 
         # 收集所有GT和预测ID
@@ -573,6 +584,76 @@ class TrackingEvaluator:
                 prev_global_objs = {gid: frame_objs[lid] for lid, gid in local_to_global.items()}
 
         return dict(associated_gt)
+
+    def load_mot_gt(
+        self,
+        gt_path: Path,
+        class_ids: Optional[List[int]] = None,
+        min_visibility: float = 0.0,
+    ) -> Dict[int, Dict[int, np.ndarray]]:
+        """
+        加载 MOT Challenge 格式 GT 标注
+
+        MOT 格式: <frame>, <id>, <bb_left>, <bb_top>, <bb_width>, <bb_height>,
+                   <confidence>, <class>, <visibility>
+        坐标为左上角 + 宽高，转换为 [x1, y1, x2, y2]
+
+        Args:
+            gt_path: gt.txt 文件路径
+            class_ids: 要加载的类别ID列表（MOT17中1=pedestrian, 2=person on vehicle等），None则加载全部
+            min_visibility: 最小可见度阈值（0~1），低于此值的GT忽略
+
+        Returns:
+            {frame_id: {obj_id: [x1, y1, x2, y2]}}
+        """
+        gt = defaultdict(dict)
+
+        if not gt_path.exists():
+            print(f"警告: MOT GT文件不存在: {gt_path}")
+            return dict(gt)
+
+        with open(gt_path, 'r') as f:
+            for line in f:
+                parts = line.strip().split(',')
+                if len(parts) < 7:
+                    continue
+
+                frame_id = int(parts[0])
+                obj_id = int(parts[1])
+                bb_left = float(parts[2])
+                bb_top = float(parts[3])
+                bb_width = float(parts[4])
+                bb_height = float(parts[5])
+                confidence = float(parts[6])
+
+                # MOT17 GT中 confidence=0 表示忽略区域
+                if confidence == 0:
+                    continue
+
+                # 类别过滤
+                if len(parts) >= 8 and class_ids is not None:
+                    cls_id = int(parts[7])
+                    if cls_id not in class_ids:
+                        continue
+
+                # 可见度过滤
+                if len(parts) >= 9:
+                    visibility = float(parts[8])
+                    if visibility < min_visibility:
+                        continue
+
+                # 转换 (x, y, w, h) -> [x1, y1, x2, y2]
+                x1 = bb_left
+                y1 = bb_top
+                x2 = bb_left + bb_width
+                y2 = bb_top + bb_height
+
+                gt[frame_id][obj_id] = np.array([x1, y1, x2, y2], dtype=np.float32)
+
+        print(f"MOT GT加载: {gt_path.name} | {len(gt)}帧, "
+              f"共{sum(len(v) for v in gt.values())}个标注, "
+              f"{len(set(oid for frame in gt.values() for oid in frame.keys()))}个目标ID")
+        return dict(gt)
 
     def load_kitti_gt(self, label_path: Path) -> Dict[int, Dict[int, np.ndarray]]:
         """

@@ -67,20 +67,23 @@ class ReIDExtractor:
         weights_path: Optional[str] = None,
         use_torchreid: bool = True,
         smooth_alpha: float = 0.7,
+        use_finetuned: bool = False,
     ):
         """
         初始化 ReID 特征提取器
-        
+
         Args:
             model_name: 模型名称 (osnet_x1_0, osnet_x0_75, resnet50, mobilenet)
             device: 设备 (cuda:0, cpu)
             weights_path: 预训练权重路径
             use_torchreid: 是否使用 torchreid 库
             smooth_alpha: EMA平滑系数（新特征权重，低值=更稳定）
+            use_finetuned: 是否优先使用 LoRA 微调后的权重
         """
         self.model_name = model_name
         self.device = device
         self.smooth_alpha = smooth_alpha
+        self.use_finetuned = use_finetuned
         
         # 检测设备
         if device.startswith('cuda') and not torch.cuda.is_available():
@@ -122,8 +125,18 @@ class ReIDExtractor:
             search_paths = []
             if weights_path:
                 search_paths.append(Path(weights_path))
-            # 项目目录
+
+            # 微调权重（LoRA 合并后的完整模型）- 最高优先级
             project_root = Path(__file__).resolve().parents[2]
+            if self.use_finetuned:
+                search_paths.append(project_root / 'runs' / 'reid' / 'osnet_lora' / 'best.pth')
+                search_paths.append(project_root / 'runs' / 'reid' / 'osnet_lora' / 'last.pth')
+
+            # 项目目录 - 预训练权重（优先搜索项目根目录，然后是 weights 子目录）
+            search_paths.append(project_root / f'{self.model_name}_msmt17.pt')
+            search_paths.append(project_root / f'{self.model_name}_msmt17.pth')
+            search_paths.append(project_root / f'{self.model_name}.pt')
+            search_paths.append(project_root / f'{self.model_name}.pth')
             search_paths.append(project_root / 'weights' / f'{self.model_name}_msmt17.pt')
             search_paths.append(project_root / 'weights' / f'{self.model_name}_msmt17.pth')
             search_paths.append(project_root / 'weights' / f'{self.model_name}.pt')
@@ -163,7 +176,11 @@ class ReIDExtractor:
                 if 'state_dict' in state_dict:
                     state_dict = state_dict['state_dict']
                 self.model.load_state_dict(state_dict, strict=True)
-                print(f'[ReID] 已加载权重: {weights_file}')
+
+                # 判断权重类型
+                is_finetuned = 'reid' in str(weights_file) or 'osnet_lora' in str(weights_file)
+                tag = '[微调]' if is_finetuned else '[预训练]'
+                print(f'[ReID] {tag} 已加载权重: {weights_file} (num_classes={num_classes})')
                 loaded = True
             
             if not loaded:

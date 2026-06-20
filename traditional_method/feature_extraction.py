@@ -7,7 +7,7 @@
      - 对光照变化有一定鲁棒性
   
   2. HOG 特征 (Histogram of Oriented Gradients): 描述目标形状轮廓
-     - 统计局部梯度方向分布
+     - 支持手动实现和OpenCV API两种模式
      - 对颜色变化不敏感
   
   3. 融合特征: 颜色 + 形状 加权组合
@@ -24,6 +24,9 @@ import cv2
 import numpy as np
 from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
+
+# 导入HOG特征提取器
+from traditional_method.hog_detector import HOGFeatureExtractor
 
 
 @dataclass
@@ -46,20 +49,23 @@ class FeatureExtractor:
     
     提取:
     - HSV 颜色直方图 (94维)
-    - HOG 形状特征 (3780维)
+    - HOG 形状特征 (3780维) - 支持手动实现和OpenCV API两种模式
     - 融合特征向量 (归一化后)
     """
     
-    def __init__(self, config: FeatureConfig = None):
+    def __init__(self, config: FeatureConfig = None, use_opencv_api: bool = True):
         self.config = config or FeatureConfig()
+        self.use_opencv_api = use_opencv_api
         
         if self.config.use_hog:
-            self.hog = cv2.HOGDescriptor(
-                _winSize=self.config.hog_win_size,
-                _blockSize=(16, 16),
-                _blockStride=(8, 8),
-                _cellSize=(8, 8),
-                _nbins=9,
+            # 使用HOG特征提取器（支持手动实现和OpenCV API两种模式）
+            self.hog_extractor = HOGFeatureExtractor(
+                win_size=self.config.hog_win_size,
+                cell_size=(8, 8),
+                block_size=(2, 2),
+                block_stride=(1, 1),
+                nbins=9,
+                use_opencv_api=use_opencv_api,
             )
     
     def extract_color_histogram(self, image: np.ndarray, bbox: np.ndarray) -> np.ndarray:
@@ -135,8 +141,8 @@ class FeatureExtractor:
         patch = image[y1:y2, x1:x2]
         patch = cv2.resize(patch, self.config.hog_win_size)
         
-        features = self.hog.compute(patch)
-        features = features.flatten()
+        # 使用HOG特征提取器（根据use_opencv_api决定使用API还是手动实现）
+        features = self.hog_extractor.compute(patch)
         
         # L2 归一化
         norm = np.linalg.norm(features)

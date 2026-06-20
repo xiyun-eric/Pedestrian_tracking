@@ -107,6 +107,41 @@ class Conv2dLoRA(nn.Module):
         
         return orig_out + lora_out * self.scaling
     
+    # 属性代理：让 Conv2dLoRA 兼容 YOLO 的 fuse 操作
+    @property
+    def weight(self):
+        """代理到内部 conv 的 weight"""
+        return self.conv.weight
+    
+    @property
+    def bias(self):
+        """代理到内部 conv 的 bias"""
+        return self.conv.bias
+    
+    @property
+    def out_channels(self):
+        return self.conv.out_channels
+    
+    @property
+    def in_channels(self):
+        return self.conv.in_channels
+    
+    @property
+    def kernel_size(self):
+        return self.conv.kernel_size
+    
+    @property
+    def stride(self):
+        return self.conv.stride
+    
+    @property
+    def padding(self):
+        return self.conv.padding
+    
+    @property
+    def groups(self):
+        return self.conv.groups
+    
     @classmethod
     def from_conv(cls, conv: nn.Conv2d, r: int = 8, alpha: float = 16.0, dropout: float = 0.0):
         """从现有 Conv2d 创建 LoRA 版本"""
@@ -230,6 +265,35 @@ def save_lora_weights(model: nn.Module, path: str):
             lora_state[name] = param.data.clone()
     torch.save(lora_state, path)
     print(f"LoRA 权重已保存到: {path}")
+
+
+def merge_lora_to_model(model: nn.Module) -> nn.Module:
+    """
+    将所有 LoRA 权重合并回原始卷积层，并替换为标准 Conv2d
+
+    合并后模型不再包含 Conv2dLoRA 层，可以正常用 YOLO() 加载。
+    合并公式: W_merged = W_original + (lora_B @ lora_A) * (alpha / r)
+    """
+    modules_to_replace = []
+
+    for name, module in model.named_modules():
+        if isinstance(module, Conv2dLoRA):
+            # 合并权重
+            module.merge_weights()
+            # 记录需要替换的模块
+            modules_to_replace.append((name, module.conv))
+
+    # 将 Conv2dLoRA 替换回标准 Conv2d
+    for name, original_conv in modules_to_replace:
+        name_parts = name.split('.')
+        parent = model
+        for part in name_parts[:-1]:
+            parent = getattr(parent, part)
+        child_name = name_parts[-1]
+        setattr(parent, child_name, original_conv)
+
+    print(f"[LoRA] 已合并 {len(modules_to_replace)} 个 LoRA 层到原始卷积")
+    return model
 
 
 def load_lora_weights(model: nn.Module, path: str) -> nn.Module:

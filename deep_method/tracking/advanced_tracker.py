@@ -93,7 +93,21 @@ class AdvancedTrack:
         self.size_history = [self.last_seen_size.copy()]  # 尺度历史（用于判断姿态变化）
         self.feature = feature
         self.feature_history = [feature] if feature is not None else []
+        # 锚点特征：轨迹确认时保存的原始特征，不随匹配更新
+        # 用于检测特征漂移（错误匹配导致特征逐渐偏离原始身份）
+        self.anchor_feature = feature.copy() if feature is not None else None
+        self.anchor_set = False  # 是否已设置锚点（确认时设置）
         self.velocity_history = []
+        self.velocity_ema = np.zeros(2, dtype=np.float32)  # EMA平滑速度（仅cx,cy方向）
+        self.velocity_ema_initialized = False  # EMA是否已初始化
+
+        # 伪三维速度：用尺度变化率模拟深度方向运动
+        # scale_ratio > 1 表示目标变大（靠近相机），< 1 表示目标变小（远离相机）
+        self.scale_ratio_ema = 1.0  # EMA平滑的尺度变化率
+        self.scale_ratio_ema_initialized = False
+        self.pseudo_3d_velocity = np.zeros(3, dtype=np.float32)  # [vx, vy, vz] 伪三维速度
+        self.pseudo_3d_velocity_initialized = False
+
         self.track_state = TrackState.TENTATIVE
     
     def predict(self):
@@ -154,16 +168,27 @@ class AdvancedTrack:
             self.size_history = self.size_history[-30:]
         
         # 更新特征
+        # 关键防护：外观距离大时不更新特征，防止特征漂移
         if feature is not None:
+            should_update_feature = True
             if self.feature is not None:
-                # 平滑更新特征：使用较低alpha保留更多历史特征
-                # 遮挡恢复后特征变化大，低alpha避免特征被完全覆盖
-                alpha = 0.5
-                self.feature = alpha * feature + (1 - alpha) * self.feature
-                # 重新归一化
-                self.feature = self.feature / (np.linalg.norm(self.feature) + 1e-8)
-            else:
-                self.feature = feature
+                # 计算新特征与当前特征的距离
+                sim = np.dot(self.feature, feature) / (
+                    np.linalg.norm(self.feature) * np.linalg.norm(feature) + 1e-8
+                )
+                app_dist = 1 - sim
+                if app_dist > 0.3:
+                    # 外观距离>0.3（相似度<0.7），可能是错误匹配，不更新特征
+                    should_update_feature = False
+
+            if should_update_feature:
+                if self.feature is not None:
+                    # 平滑更新特征：使用较低alpha保留更多历史特征
+                    alpha = 0.5
+                    self.feature = alpha * feature + (1 - alpha) * self.feature
+                    self.feature = self.feature / (np.linalg.norm(self.feature) + 1e-8)
+                else:
+                    self.feature = feature
             self.feature_history.append(feature)
         
         # 记录速度历史
@@ -172,9 +197,49 @@ class AdvancedTrack:
         if len(self.velocity_history) > 30:
             self.velocity_history = self.velocity_history[-30:]
         
+        # 更新EMA速度（仅cx, cy方向分量）
+        current_vel = velocity[:2].copy()  # vx, vy
+        if not self.velocity_ema_initialized:
+            self.velocity_ema = current_vel.astype(np.float32)
+            self.velocity_ema_initialized = True
+        else:
+            alpha = 0.4  # EMA平滑系数（新速度权重）
+            self.velocity_ema = alpha * current_vel.astype(np.float32) + (1 - alpha) * self.velocity_ema
+
+        # 更新伪三维速度：尺度变化率 → 深度方向速度
+        # scale_ratio = 当前面积 / 历史面积，>1 表示靠近相机，<1 表示远离
+        if len(self.size_history) >= 2:
+            prev_area = self.size_history[-2][0] * self.size_history[-2][1]
+            curr_area = self.last_seen_size[0] * self.last_seen_size[1]
+            if prev_area > 1e-4:
+                scale_ratio = curr_area / prev_area
+            else:
+                scale_ratio = 1.0
+
+            if not self.scale_ratio_ema_initialized:
+                self.scale_ratio_ema = scale_ratio
+                self.scale_ratio_ema_initialized = True
+            else:
+                sr_alpha = 0.4
+                self.scale_ratio_ema = sr_alpha * scale_ratio + (1 - sr_alpha) * self.scale_ratio_ema
+
+            # 伪三维速度：[vx, vy, vz]
+            # vz 用尺度变化率偏移量近似：scale_ratio > 1 → vz > 0（靠近），< 1 → vz < 0（远离）
+            vz = (self.scale_ratio_ema - 1.0) * np.sqrt(curr_area + 1e-4)
+            self.pseudo_3d_velocity = np.array([
+                self.velocity_ema[0],
+                self.velocity_ema[1],
+                vz
+            ], dtype=np.float32)
+            self.pseudo_3d_velocity_initialized = True
+        
         # 状态转换（使用配置的min_hits）
         if self.track_state == TrackState.TENTATIVE and self.hits >= self.min_hits:
             self.track_state = TrackState.CONFIRMED
+            # 确认时设置锚点特征（不随后续匹配更新）
+            if self.feature is not None and not self.anchor_set:
+                self.anchor_feature = self.feature.copy()
+                self.anchor_set = True
     
     def mark_missed(self):
         """标记为丢失"""
@@ -254,14 +319,14 @@ class AdvancedTrackerConfig:
     # 外观特征参数
     use_reid: bool = True
     reid_model: str = 'osnet_x1_0'
-    appearance_weight: float = 0.4
-    iou_weight: float = 0.3
-    mahal_weight: float = 0.3
+    appearance_weight: float = 0.5
+    iou_weight: float = 0.2
+    mahal_weight: float = 0.15
     feature_smooth_alpha: float = 0.7
     
     # 社会行为参数
     use_social_constraint: bool = True
-    social_weight: float = 0.2
+    social_weight: float = 0.1
     overlap_threshold: float = 0.3
     
     # 自适应参数
@@ -271,7 +336,43 @@ class AdvancedTrackerConfig:
     
     # 马氏距离门控
     gating_threshold: float = 9.4877
-    
+
+    # 运动一致性约束（含伪三维扩展）
+    motion_consistency_weight: float = 0.15
+    """运动一致性代价权重（辅助约束，外观为主时运动仅作辅助验证）"""
+    motion_speed_threshold: float = 1.0
+    """静止目标速度阈值（像素/帧），低于此值视为静止"""
+    motion_displacement_threshold: float = 2.0
+    """最小位移阈值（像素），低于此值不检查方向"""
+    motion_ema_alpha: float = 0.4
+    """速度EMA平滑系数"""
+
+    # 伪三维深度约束（运动一致性的深度扩展，非独立代价）
+    pseudo_3d_scale_threshold: float = 0.02
+    """尺度变化率阈值，低于此值视为无深度方向运动，退化为纯2D检查"""
+    pseudo_3d_direction_weight: float = 0.5
+    """伪三维方向一致性在3D代价中的权重（0~1，剩余给速度一致性）"""
+    pseudo_3d_new_track_frames: int = 3
+    """新轨迹（hits <= 此值）不检查伪三维深度约束"""
+    pseudo_3d_lost_frames: int = 5
+    """丢失超过此帧数后，深度约束大幅降权"""
+    pseudo_3d_depth_cost_weight: float = 0.3
+    """深度方向矛盾在3D代价中的权重"""
+
+    # 尺度一致性约束
+    scale_weight: float = 0.15
+    """尺度一致性代价权重（辅助约束），设为0禁用"""
+
+    # 非线性惩罚参数（尺度、空间位置、速度变化异常时非线性惩罚）
+    nonlinear_penalty_enabled: bool = True
+    """是否启用非线性惩罚（变化越大惩罚越大）"""
+    nonlinear_gentle_slope: float = 0.3
+    """非线性惩罚中等区间斜率（二次项系数，控制温和区间增长速度）"""
+    nonlinear_steep_slope: float = 1.5
+    """非线性惩罚大偏差区间斜率（指数项系数，控制大偏差惩罚陡峭程度）"""
+    nonlinear_transition: float = 1.0
+    """非线性惩罚从二次到指数的过渡点（归一化偏差值）"""
+
     # 场景参数
     scene_type: str = 'general'
     camera_motion: bool = False
@@ -540,6 +641,14 @@ class AdvancedTracker:
         unmatched_dets = list(range(len(detections)))
         
         # 按年龄级联匹配确认轨迹
+        # 检测保护机制：记录每轮中与稳定轨迹"接近匹配"的检测
+        # 阻止这些检测在后续轮次中被丢失更久的轨迹抢走
+        protected_dets = {}  # det_idx -> (track_idx, cost, appearance_dist)
+
+        # 交叉外观检查：记录每个检测与已处理稳定轨迹的最佳外观匹配
+        # 仅记录 age=1 轮（最稳定的轨迹）的外观信息
+        best_appearance_match = {}  # det_idx -> appearance_dist
+
         for age in range(1, self.config.max_age + 1):
             if len(unmatched_dets) == 0:
                 break
@@ -552,9 +661,14 @@ class AdvancedTracker:
             if len(track_indices) == 0:
                 continue
             
+            # 过滤掉被保护的检测（已被更稳定轨迹声明关联）
+            available_dets = [d for d in unmatched_dets if d not in protected_dets]
+            if len(available_dets) == 0:
+                continue
+            
             # 计算代价矩阵
             cost_matrix = self._compute_cost_matrix(
-                detections, confidences, features, track_indices, unmatched_dets
+                detections, confidences, features, track_indices, available_dets
             )
             
             # 匈牙利算法
@@ -564,7 +678,6 @@ class AdvancedTracker:
             current_matched = []
             for row, col in zip(row_ind, col_ind):
                 # 代价阈值过滤：根据目标尺寸动态调整阈值
-                # 小目标（中远处）使用更高阈值（更宽容）
                 track_idx = track_indices[row]
                 track = self.tracks[track_idx]
                 
@@ -582,9 +695,54 @@ class AdvancedTracker:
                 else:
                     cost_threshold = 0.5  # 默认
                 
-                if cost_matrix[row, col] < cost_threshold:
-                    det_idx = unmatched_dets[col]
+                cost_val = cost_matrix[row, col]
+                det_idx = available_dets[col]
+
+                if cost_val < cost_threshold:
+                    # 交叉外观检查：仅对丢失轨迹（age>1）生效
+                    # 如果该检测与某个稳定轨迹的外观更匹配，阻止丢失轨迹抢走它
+                    if age > 1 and det_idx in best_appearance_match and features is not None:
+                        if track.feature is not None:
+                            det_feature = features[det_idx]
+                            cur_app_dist = 1 - np.dot(track.feature, det_feature) / (
+                                np.linalg.norm(track.feature) * np.linalg.norm(det_feature) + 1e-8
+                            )
+                            stable_app_dist = best_appearance_match[det_idx]
+                            # 稳定轨迹外观更匹配（差距 > 0.2），拒绝丢失轨迹的匹配
+                            if stable_app_dist < cur_app_dist - 0.2:
+                                continue
+
                     current_matched.append((track_idx, det_idx))
+                    # 匹配成功，移除该检测的保护标记
+                    if det_idx in protected_dets:
+                        del protected_dets[det_idx]
+                elif age == 1 and cost_val < cost_threshold * 1.5:
+                    # 仅稳定轨迹（age=1）可以声明检测保护
+                    # 代价接近但未通过阈值，声明关联防止被丢失轨迹抢走
+                    if det_idx not in protected_dets:
+                        # 记录外观距离用于后续交叉检查
+                        app_d = 0.5
+                        if features is not None and track.feature is not None:
+                            det_feature = features[det_idx]
+                            app_d = 1 - np.dot(track.feature, det_feature) / (
+                                np.linalg.norm(track.feature) * np.linalg.norm(det_feature) + 1e-8
+                            )
+                        protected_dets[det_idx] = (track_idx, cost_val, app_d)
+
+            # age=1轮结束后，记录每个检测与稳定轨迹的最佳外观匹配
+            # 这些信息用于后续轮次的交叉外观检查
+            if age == 1 and features is not None:
+                for track_idx in track_indices:
+                    track = self.tracks[track_idx]
+                    if track.feature is None:
+                        continue
+                    for det_idx in available_dets:
+                        det_feature = features[det_idx]
+                        app_dist = 1 - np.dot(track.feature, det_feature) / (
+                            np.linalg.norm(track.feature) * np.linalg.norm(det_feature) + 1e-8
+                        )
+                        if det_idx not in best_appearance_match or app_dist < best_appearance_match[det_idx]:
+                            best_appearance_match[det_idx] = app_dist
             
             # 更新匹配列表和未匹配检测
             matched.extend(current_matched)
@@ -636,113 +794,499 @@ class AdvancedTracker:
                 
                 # 3. 外观相似度
                 appearance_dist = 0.5  # 默认值
+                anchor_dist = None  # 锚点特征与检测的距离
                 if features is not None and track.feature is not None:
                     det_feature = features[det_idx]
                     similarity = np.dot(track.feature, det_feature) / (
                         np.linalg.norm(track.feature) * np.linalg.norm(det_feature) + 1e-8
                     )
                     appearance_dist = 1 - similarity
+                    # 锚点距离：检测与轨迹原始身份特征的差距
+                    if track.anchor_feature is not None:
+                        anchor_sim = np.dot(track.anchor_feature, det_feature) / (
+                            np.linalg.norm(track.anchor_feature) * np.linalg.norm(det_feature) + 1e-8
+                        )
+                        anchor_dist = 1 - anchor_sim
                 
                 # 门控检查
                 if mahal_dist > self.config.gating_threshold:
                     cost_matrix[i, j] = 1e5
                     continue
                 
-                # 5. 尺度一致性代价（对小目标更宽容）
-                # 原理：2D场景下，同一人的检测框面积不应剧烈变化
-                # 但小目标（中远处）的检测框大小波动更大，需要放宽阈值
-                scale_cost = 0
-                det_w = det[2] - det[0]
-                det_h = det[3] - det[1]
-                det_area = det_w * det_h
-                if det_area > 0 and len(track.size_history) > 0:
-                    # 使用历史平均面积（更稳定）
-                    hist_areas = [s[0] * s[1] for s in track.size_history[-5:]]
-                    avg_area = np.mean(hist_areas)
-                    if avg_area > 0:
-                        area_ratio = det_area / avg_area
-                        
-                        # 根据目标尺寸动态调整阈值
-                        # 小目标（面积<500像素²）检测波动大，放宽阈值
-                        # 中目标（500~2000像素²）使用标准阈值
-                        # 大目标（>2000像素²）使用严格阈值
-                        if avg_area < 500:  # 小目标（中远处）
-                            # 放宽阈值：面积比在0.3~3.0范围内不惩罚
-                            if area_ratio > 3.0:
-                                scale_cost = min(1.0, (area_ratio - 3.0) * 0.3)
-                            elif area_ratio < 0.3:
-                                scale_cost = min(1.0, (0.3 - area_ratio) * 0.5)
-                            elif area_ratio > 2.0 or area_ratio < 0.5:
-                                # 轻微惩罚
-                                scale_cost = 0.05 * abs(area_ratio - 1.0)
-                        elif avg_area < 2000:  # 中目标
-                            # 标准阈值：面积比在0.5~2.0范围内不惩罚
-                            if area_ratio > 2.0:
-                                scale_cost = min(1.0, (area_ratio - 2.0) * 0.5)
-                            elif area_ratio < 0.5:
-                                scale_cost = min(1.0, (0.5 - area_ratio) * 1.0)
-                            elif area_ratio > 1.5 or area_ratio < 0.67:
-                                scale_cost = 0.1 * abs(area_ratio - 1.0)
-                        else:  # 大目标（近处）
-                            # 严格阈值：面积比在0.6~1.7范围内不惩罚
-                            if area_ratio > 1.7:
-                                scale_cost = min(1.0, (area_ratio - 1.7) * 0.7)
-                            elif area_ratio < 0.6:
-                                scale_cost = min(1.0, (0.6 - area_ratio) * 1.5)
-                            elif area_ratio > 1.3 or area_ratio < 0.8:
-                                scale_cost = 0.15 * abs(area_ratio - 1.0)
-                
                 # 4. 社会行为约束
                 social_cost = 0
                 if self.config.use_social_constraint:
                     social_cost = self._compute_social_cost(track_idx, det)
                 
-                # 动态调整外观权重：IoU高时降低外观权重
-                # 原理：当空间位置高度重叠时，即使外观变化（如背身/侧身），
-                # 也应信任空间匹配而非外观匹配
+                # 5. 尺度一致性代价（对小目标更宽容）
+                # 负责"面积是否合理"的静态检查，与运动约束中的深度方向检查互补
+                scale_cost = self._compute_scale_cost(track, det)
+                
+                # 6. 统一运动一致性约束（2D方向/速度 + 伪三维深度扩展）
+                motion_cost = 0
+                if self.config.motion_consistency_weight > 0:
+                    motion_cost = self._compute_motion_consistency_cost(
+                        track, det, appearance_dist
+                    )
+                
+                # 动态调整外观权重
+                # 核心原则：外观降权仅在"外观距离较小（可能是视角变化）"时生效
+                #   目的：避免同一人正侧身导致的ID切换
+                #   约束：外观明显不同时绝不降权，防止不同人交汇时ID切换
+                #
+                #   - IoU高 + 外观相似（app_dist<0.25）：同一人视角微变，大幅降权外观，信任空间
+                #   - IoU高 + 外观中等差异（0.25<app_dist<0.45）：可能是转身，适度降权外观
+                #   - IoU高 + 外观差异大（app_dist>0.45）：不同人交汇，保持完整外观权重，不降权
+                #   - IoU低：空间位置无参考价值，外观为主
+                #   - 锚点漂移：当前特征已偏离原始身份，用锚点距离替代外观距离判断
                 base_app_w = self.adaptive_params.get('appearance_weight', self.config.appearance_weight)
                 iou_w = self.adaptive_params.get('iou_weight', self.config.iou_weight)
-                
-                # 对于刚匹配过的轨迹（time_since_update小），更激进地信任空间位置
-                # 因为短时间内同一位置的目标大概率是同一个人
-                if track.time_since_update <= 1:
-                    # 刚匹配或连续匹配：IoU>0.2就大幅降低外观权重
-                    if iou > 0.2:
-                        dynamic_app_w = base_app_w * 0.1
-                        dynamic_iou_w = iou_w + base_app_w * 0.9
-                    elif iou > 0.1:
-                        ratio = (iou - 0.1) / 0.1
-                        dynamic_app_w = base_app_w * (1 - 0.8 * ratio)
-                        dynamic_iou_w = iou_w + base_app_w * 0.8 * ratio
+                has_reid = features is not None and track.feature is not None
+
+                # 锚点漂移检测：如果当前特征与锚点距离大，说明特征已漂移
+                # 此时用锚点距离替代外观距离做判断更可靠
+                feature_drifted = False
+                effective_app_dist = appearance_dist
+                if anchor_dist is not None and anchor_dist > 0.35:
+                    # 检测与锚点（原始身份）差距大 → 可能不是同一人
+                    feature_drifted = True
+                    effective_app_dist = max(appearance_dist, anchor_dist)
+
+                # 外观距离超过阈值时，不进行外观降权（外观明显不同≠视角变化）
+                # 只有外观距离较小时，才可能是同一人的视角变化，允许降权
+                APP_DIST_VIEWPOINT_THRESHOLD = 0.45  # 超过此值视为不同人，不降权
+
+                if effective_app_dist >= APP_DIST_VIEWPOINT_THRESHOLD:
+                    # 外观明显不同：不可能是视角变化，保持完整外观权重
+                    dynamic_app_w = base_app_w
+                    dynamic_iou_w = iou_w
+                elif track.time_since_update <= 1:
+                    if iou > 0.5:
+                        if not has_reid:
+                            dynamic_app_w = base_app_w * 0.15
+                            dynamic_iou_w = iou_w + base_app_w * 0.85
+                        elif effective_app_dist < 0.25:
+                            dynamic_app_w = base_app_w * 0.15
+                            dynamic_iou_w = iou_w + base_app_w * 0.85
+                        else:
+                            # 0.25 < app_dist < 0.45：可能是转身，适度降权
+                            dynamic_app_w = base_app_w * 0.5
+                            dynamic_iou_w = iou_w + base_app_w * 0.5
+                    elif iou > 0.3:
+                        if not has_reid:
+                            dynamic_app_w = base_app_w * 0.5
+                            dynamic_iou_w = iou_w + base_app_w * 0.5
+                        elif effective_app_dist < 0.25:
+                            dynamic_app_w = base_app_w * 0.4
+                            dynamic_iou_w = iou_w + base_app_w * 0.6
+                        else:
+                            dynamic_app_w = base_app_w * 0.7
+                            dynamic_iou_w = iou_w + base_app_w * 0.3
                     else:
                         dynamic_app_w = base_app_w
                         dynamic_iou_w = iou_w
                 else:
-                    # 丢失过一段时间的轨迹：保守一些
                     if iou > 0.5:
-                        dynamic_app_w = base_app_w * 0.2
-                        dynamic_iou_w = iou_w + base_app_w * 0.8
+                        if not has_reid:
+                            dynamic_app_w = base_app_w * 0.3
+                            dynamic_iou_w = iou_w + base_app_w * 0.7
+                        elif effective_app_dist < 0.25:
+                            dynamic_app_w = base_app_w * 0.3
+                            dynamic_iou_w = iou_w + base_app_w * 0.7
+                        else:
+                            dynamic_app_w = base_app_w * 0.6
+                            dynamic_iou_w = iou_w + base_app_w * 0.4
                     elif iou > 0.3:
-                        ratio = (iou - 0.3) / 0.2
-                        dynamic_app_w = base_app_w * (1 - 0.6 * ratio)
-                        dynamic_iou_w = iou_w + base_app_w * 0.6 * ratio
+                        if not has_reid:
+                            dynamic_app_w = base_app_w * 0.7
+                            dynamic_iou_w = iou_w + base_app_w * 0.3
+                        elif effective_app_dist < 0.25:
+                            dynamic_app_w = base_app_w * 0.6
+                            dynamic_iou_w = iou_w + base_app_w * 0.4
+                        else:
+                            dynamic_app_w = base_app_w * 0.8
+                            dynamic_iou_w = iou_w + base_app_w * 0.2
                     else:
                         dynamic_app_w = base_app_w
                         dynamic_iou_w = iou_w
+
+                # 外观差距极大时的额外惩罚
+                # 即使IoU高，如果外观完全不像，也应增加代价防止ID互换
+                appearance_penalty = 0.0
+                if has_reid and appearance_dist > 0.6:
+                    appearance_penalty = (appearance_dist - 0.6) * 0.5
+
+                # 锚点漂移惩罚：检测与锚点（原始身份）差距大时额外惩罚
+                # 防止特征漂移后"自我强化"导致持续错误匹配
+                anchor_penalty = 0.0
+                if anchor_dist is not None and anchor_dist > 0.35:
+                    anchor_penalty = (anchor_dist - 0.35) * 0.6
+
+                # 空间距离惩罚：基于轨迹最后已知位置与检测的距离
+                # 防止外观相似但空间距离远的错误匹配（如穿相似衣服的不同人）
+                # 使用最后已知位置而非预测位置，因为预测位置可能漂移
+                # 非线性惩罚：距离越远惩罚越陡峭
+                spatial_penalty = 0.0
+                if track.time_since_update > 0 and has_reid:
+                    # 用轨迹最后已知位置（last_seen_bbox）计算距离
+                    last_bbox = track.last_seen_bbox
+                    if last_bbox is not None:
+                        last_cx = (last_bbox[0] + last_bbox[2]) / 2
+                        last_cy = (last_bbox[1] + last_bbox[3]) / 2
+                        det_cx = (det[0] + det[2]) / 2
+                        det_cy = (det[1] + det[3]) / 2
+                        # 归一化距离：用轨迹尺寸作为参考尺度
+                        last_h = last_bbox[3] - last_bbox[1]
+                        if last_h > 1e-4:
+                            dist_pixels = np.sqrt((det_cx - last_cx)**2 + (det_cy - last_cy)**2)
+                            dist_normalized = dist_pixels / last_h  # 以身高为单位的距离
+                            # 丢失时间越长，允许的距离越大（目标可能移动了）
+                            max_allowed = 1.0 + 0.3 * track.time_since_update
+                            if dist_normalized > max_allowed:
+                                excess = dist_normalized - max_allowed
+                                # 非线性惩罚：超出允许距离越多，惩罚越陡
+                                spatial_penalty = self._nonlinear_penalty(
+                                    deviation=dist_normalized,
+                                    threshold=max_allowed,
+                                    max_penalty=0.5,
+                                )
                 
+                # 统一运动约束权重调整（合并2D+3D的边界处理）
+                motion_weight = self._compute_motion_weight(track, appearance_dist)
+
                 # 融合代价
                 cost = (
                     dynamic_iou_w * iou_dist +
                     self.config.mahal_weight * mahal_norm +
                     dynamic_app_w * appearance_dist +
                     self.config.social_weight * social_cost +
-                    0.3 * scale_cost  # 尺度一致性代价
+                    self.config.scale_weight * scale_cost +
+                    motion_weight * motion_cost +
+                    appearance_penalty +
+                    anchor_penalty +
+                    spatial_penalty
                 )
                 
                 cost_matrix[i, j] = cost
         
         return cost_matrix
     
+    def _nonlinear_penalty(
+        self,
+        deviation: float,
+        threshold: float = 0.0,
+        max_penalty: float = 1.0,
+    ) -> float:
+        """
+        非线性惩罚函数：变化越大惩罚越大
+
+        分段设计：
+        - deviation <= threshold：无惩罚（正常范围）
+        - threshold < deviation <= threshold + transition：二次增长（温和区间）
+        - deviation > threshold + transition：指数增长（大偏差区间，惩罚陡增）
+
+        这确保了中等偏差有适度惩罚，而异常大的偏差会受到显著惩罚，
+        有效抑制外观相似但尺度/位置/速度严重异常的错误匹配。
+
+        Args:
+            deviation: 偏差值（已取绝对值的正数）
+            threshold: 容忍阈值，低于此值无惩罚
+            max_penalty: 最大惩罚值（截断上限）
+
+        Returns:
+            非线性惩罚值 [0, max_penalty]
+        """
+        if not self.config.nonlinear_penalty_enabled:
+            # 线性回退
+            if deviation <= threshold:
+                return 0.0
+            return min(max_penalty, deviation - threshold)
+
+        if deviation <= threshold:
+            return 0.0
+
+        excess = deviation - threshold
+        gentle = self.config.nonlinear_gentle_slope
+        steep = self.config.nonlinear_steep_slope
+        transition = self.config.nonlinear_transition
+
+        if excess <= transition:
+            # 二次增长：温和区间，惩罚缓慢上升
+            penalty = gentle * (excess / transition) ** 2 * transition
+        else:
+            # 指数增长：大偏差区间，惩罚陡增
+            # 先算二次区间在过渡点的值
+            base_penalty = gentle * transition
+            # 指数部分：从过渡点开始指数增长
+            penalty = base_penalty + steep * (np.exp((excess - transition) / transition) - 1)
+
+        return min(max_penalty, penalty)
+
+    def _compute_scale_cost(
+        self,
+        track: AdvancedTrack,
+        det: np.ndarray,
+    ) -> float:
+        """
+        计算尺度一致性代价（静态检查：面积是否合理）
+
+        使用非线性惩罚：面积比值偏离1.0越大，惩罚增长越陡峭。
+        - 中等偏差（如面积比1.3~1.7）：温和惩罚
+        - 较大偏差（如面积比>2.0或<0.5）：惩罚陡增
+
+        对小目标更宽容（检测波动大），对大目标更严格。
+
+        Args:
+            track: 轨迹对象
+            det: 检测框 [x1, y1, x2, y2]
+
+        Returns:
+            尺度一致性代价 [0, 1]
+        """
+        scale_cost = 0
+        det_w = det[2] - det[0]
+        det_h = det[3] - det[1]
+        det_area = det_w * det_h
+        if det_area > 0 and len(track.size_history) > 0:
+            hist_areas = [s[0] * s[1] for s in track.size_history[-5:]]
+            avg_area = np.mean(hist_areas)
+            if avg_area > 0:
+                area_ratio = det_area / avg_area
+
+                # 面积比值偏离1.0的绝对偏差
+                deviation = abs(area_ratio - 1.0)
+
+                if avg_area < 500:  # 小目标（中远处）
+                    # 小目标检测波动大，容忍阈值更宽
+                    threshold = 0.7  # area_ratio在0.3~1.7范围内无惩罚
+                elif avg_area < 2000:  # 中目标
+                    threshold = 0.5  # area_ratio在0.5~1.5范围内无惩罚
+                else:  # 大目标（近处）
+                    threshold = 0.3  # area_ratio在0.7~1.3范围内无惩罚
+
+                scale_cost = self._nonlinear_penalty(
+                    deviation=deviation,
+                    threshold=threshold,
+                    max_penalty=1.0,
+                )
+
+        return scale_cost
+
+    def _compute_motion_weight(
+        self,
+        track: AdvancedTrack,
+        appearance_dist: float,
+    ) -> float:
+        """
+        统一运动约束权重调整（合并2D+3D的边界处理）
+
+        综合考虑：
+        - 轨迹丢失时间：丢失越久运动信息越不可靠
+        - 新轨迹：数据不足，降权
+        - 外观相似度：高相似度时运动约束降权（可能是转身等合理变化）
+
+        Args:
+            track: 轨迹对象
+            appearance_dist: 外观距离
+
+        Returns:
+            调整后的运动约束权重
+        """
+        weight = self.config.motion_consistency_weight
+
+        # 丢失时间降权
+        if track.time_since_update <= 2:
+            pass  # 连续跟踪或刚丢失1-2帧，权重正常
+        elif track.time_since_update <= 10:
+            weight *= 0.5
+        else:
+            weight *= 0.2
+
+        # 新轨迹深度约束降权（2D部分保留，3D深度部分关闭）
+        if track.hits <= self.config.pseudo_3d_new_track_frames:
+            # 新轨迹：只保留2D运动检查的权重（约60%），深度部分不可靠
+            weight *= 0.6
+        # 丢失超过阈值帧数后，深度约束额外降权
+        elif track.time_since_update > self.config.pseudo_3d_lost_frames:
+            weight *= 0.7  # 在丢失时间降权基础上再降
+
+        # 外观相似度调整
+        if appearance_dist < 0.1:  # similarity > 0.9
+            weight *= 0.2
+        elif appearance_dist < 0.2:  # similarity > 0.8
+            weight *= 0.5
+        elif appearance_dist > 0.5:  # similarity < 0.5
+            weight *= 1.5
+
+        return weight
+
+    def _compute_motion_consistency_cost(
+        self,
+        track: AdvancedTrack,
+        det: np.ndarray,
+        appearance_dist: float,
+    ) -> float:
+        """
+        统一运动一致性代价（2D方向/速度 + 伪三维深度扩展）
+
+        无深度运动时：仅做2D方向+速度检查
+        有深度运动时：升级为3D方向+速度检查，并增加深度方向矛盾检查
+
+        速度一致性使用非线性惩罚：速度比偏离1.0越大，惩罚越陡峭。
+        方向一致性使用非线性惩罚：cos_angle偏离1.0越大，惩罚越陡峭。
+
+        与 scale_cost 的分工：
+        - scale_cost：面积比值是否在合理范围（静态检查）
+        - 本方法：运动方向/速度是否一致，深度方向是否矛盾（动态检查）
+        两者不重复惩罚同一信息。
+
+        Args:
+            track: 轨迹对象
+            det: 检测框 [x1, y1, x2, y2]
+            appearance_dist: 外观距离
+
+        Returns:
+            运动一致性代价 [0, 1]
+        """
+        # ===== 2D运动基础检查 =====
+        if not track.velocity_ema_initialized:
+            return 0.0
+
+        ema_vel = track.velocity_ema  # (vx, vy)
+        ema_speed = np.linalg.norm(ema_vel)
+
+        if ema_speed < self.config.motion_speed_threshold:
+            return 0.0
+
+        # 计算2D位移
+        track_bbox = track.get_bbox()
+        track_cx = (track_bbox[0] + track_bbox[2]) / 2
+        track_cy = (track_bbox[1] + track_bbox[3]) / 2
+        det_cx = (det[0] + det[2]) / 2
+        det_cy = (det[1] + det[3]) / 2
+        disp_2d = np.array([det_cx - track_cx, det_cy - track_cy], dtype=np.float32)
+        det_speed_2d = np.linalg.norm(disp_2d) / max(1, track.time_since_update)
+
+        if det_speed_2d < self.config.motion_displacement_threshold:
+            return 0.0
+
+        # 2D方向一致性（非线性惩罚：方向偏差越大惩罚越陡）
+        # cos_angle: 1=同向, 0=垂直, -1=反向
+        ema_dir = ema_vel / (ema_speed + 1e-8)
+        disp_dir = disp_2d / (np.linalg.norm(disp_2d) + 1e-8)
+        cos_angle_2d = np.dot(ema_dir, disp_dir)
+
+        # 方向偏差：0=完美同向, 1=垂直, 2=反向
+        direction_deviation_2d = 1.0 - cos_angle_2d  # [0, 2]
+        # 容忍阈值：方向偏差<0.3（cos>0.7）视为正常
+        direction_cost_2d = self._nonlinear_penalty(
+            deviation=direction_deviation_2d,
+            threshold=0.3,
+            max_penalty=1.0,
+        )
+
+        # 2D速度一致性（非线性惩罚：速度比偏离1.0越大惩罚越陡）
+        speed_ratio_2d = det_speed_2d / (ema_speed + 1e-8)
+        # 速度比偏差：偏离1.0的量
+        speed_deviation_2d = abs(speed_ratio_2d - 1.0)
+        # 容忍阈值：速度比在0.5~1.5范围内（偏差<0.5）视为正常
+        speed_cost_2d = self._nonlinear_penalty(
+            deviation=speed_deviation_2d,
+            threshold=0.5,
+            max_penalty=1.0,
+        )
+
+        # 2D综合代价
+        cost_2d = 0.6 * direction_cost_2d + 0.4 * speed_cost_2d
+
+        # ===== 伪三维深度扩展 =====
+        # 仅当有可靠的深度运动信息时才升级为3D检查
+        depth_motion = (
+            track.pseudo_3d_velocity_initialized
+            and track.scale_ratio_ema_initialized
+            and abs(track.scale_ratio_ema - 1.0) > self.config.pseudo_3d_scale_threshold
+            and track.hits > self.config.pseudo_3d_new_track_frames
+        )
+
+        if not depth_motion:
+            return min(1.0, cost_2d)
+
+        # 有深度运动：用3D方向替代2D方向检查（避免重复）
+        track_vel_3d = track.pseudo_3d_velocity  # [vx, vy, vz]
+        track_speed_3d = np.linalg.norm(track_vel_3d)
+
+        # 深度方向位移
+        det_w = det[2] - det[0]
+        det_h = det[3] - det[1]
+        det_area = det_w * det_h
+        disp_z = 0.0
+        if len(track.size_history) > 0 and det_area > 1e-4:
+            hist_areas = [s[0] * s[1] for s in track.size_history[-5:]]
+            avg_area = np.mean(hist_areas)
+            if avg_area > 1e-4:
+                area_ratio = det_area / avg_area
+                disp_z = (area_ratio - 1.0) * np.sqrt(avg_area)
+
+        disp_3d = np.array([disp_2d[0], disp_2d[1], disp_z], dtype=np.float32)
+        disp_3d_norm = np.linalg.norm(disp_3d)
+
+        if disp_3d_norm < self.config.motion_displacement_threshold:
+            return min(1.0, cost_2d)
+
+        # 3D方向一致性（非线性惩罚）
+        track_dir_3d = track_vel_3d / (track_speed_3d + 1e-8)
+        disp_dir_3d = disp_3d / (disp_3d_norm + 1e-8)
+        cos_angle_3d = np.dot(track_dir_3d, disp_dir_3d)
+
+        direction_deviation_3d = 1.0 - cos_angle_3d
+        direction_cost_3d = self._nonlinear_penalty(
+            deviation=direction_deviation_3d,
+            threshold=0.3,
+            max_penalty=1.0,
+        )
+
+        # 3D速度一致性（非线性惩罚）
+        det_speed_3d = disp_3d_norm / max(1, track.time_since_update)
+        speed_ratio_3d = det_speed_3d / (track_speed_3d + 1e-8)
+        speed_deviation_3d = abs(speed_ratio_3d - 1.0)
+        speed_cost_3d = self._nonlinear_penalty(
+            deviation=speed_deviation_3d,
+            threshold=0.5,
+            max_penalty=1.0,
+        )
+
+        # 深度方向矛盾检查（独立于scale_cost：scale_cost检查面积绝对值，
+        # 这里检查深度方向是否与历史运动趋势矛盾）
+        # 使用非线性惩罚：深度方向矛盾越大惩罚越陡
+        depth_cost = 0.0
+        track_vz = track_vel_3d[2]
+        det_vz = disp_z / max(1, track.time_since_update)
+        if track_vz * det_vz < 0:
+            # 深度方向相反：用非线性惩罚，偏差越大惩罚越重
+            # 方向完全相反时deviation=2（最大偏差）
+            vz_conflict = abs(track_vz) + abs(det_vz)
+            depth_cost = self._nonlinear_penalty(
+                deviation=vz_conflict,
+                threshold=0.0,
+                max_penalty=1.0,
+            )
+        elif abs(track_vz) > 1e-4 and abs(det_vz) > 1e-4:
+            vz_ratio = det_vz / (track_vz + 1e-8)
+            vz_deviation = abs(vz_ratio - 1.0)
+            depth_cost = self._nonlinear_penalty(
+                deviation=vz_deviation,
+                threshold=0.7,  # 容忍速度比在0.3~1.7范围
+                max_penalty=1.0,
+            )
+
+        # 3D综合代价（用3D方向替代2D方向，避免重复）
+        dir_w = self.config.pseudo_3d_direction_weight
+        spd_w = 1.0 - dir_w
+        depth_w = self.config.pseudo_3d_depth_cost_weight
+        cost_3d = dir_w * direction_cost_3d + spd_w * speed_cost_3d + depth_w * depth_cost
+
+        return min(1.0, cost_3d)
+
     def _compute_social_cost(
         self,
         track_idx: int,
@@ -887,28 +1431,29 @@ class AdvancedTracker:
                 # 5. 空间可信度
                 spatial_confidence = max(0, 1 - center_dist / search_radius)
                 
-                # 6. 尺度一致性检查
-                # 遮挡恢复时，目标不应突然变大/变小（近处目标不会变成远处目标）
-                scale_penalty = 0
+                # 6. 尺度一致性检查（与主代价矩阵统一逻辑）
+                scale_penalty = self._compute_scale_cost(track, det)
+
+                # 7. 伪三维深度方向惩罚
+                # 遮挡恢复时，深度方向运动趋势应与历史一致
+                depth_penalty = 0
                 det_w = det[2] - det[0]
                 det_h = det[3] - det[1]
                 det_area = det_w * det_h
-                if det_area > 0 and len(track.size_history) > 0:
-                    hist_areas = [s[0] * s[1] for s in track.size_history[-5:]]
-                    avg_area = np.mean(hist_areas)
-                    if avg_area > 0:
-                        area_ratio = det_area / avg_area
-                        if area_ratio > 2.0:
-                            # 检测框远大于历史：近处目标不可能变成远处目标
-                            scale_penalty = min(1.0, (area_ratio - 2.0) * 0.8)
-                        elif area_ratio < 0.5:
-                            # 检测框远小于历史：远处目标不可能变成近处目标
-                            scale_penalty = min(1.0, (0.5 - area_ratio) * 1.5)
+                if track.pseudo_3d_velocity_initialized and track.scale_ratio_ema_initialized:
+                    track_vz = track.pseudo_3d_velocity[2]
+                    if abs(track_vz) > 1e-2 and det_area > 0 and len(track.size_history) > 0:
+                        hist_areas_r = [s[0] * s[1] for s in track.size_history[-5:]]
+                        avg_area_r = np.mean(hist_areas_r)
+                        if avg_area_r > 1e-4:
+                            det_depth_dir = (det_area / avg_area_r - 1.0)
+                            if track_vz * det_depth_dir < 0:
+                                depth_penalty = 0.4
                 
-                # 匹配条件（满足其一即可，但运动不一致或尺度不一致时更严格）
+                # 匹配条件（满足其一即可，但运动不一致或尺度/深度不一致时更严格）
                 is_match = False
-                if not motion_consistent:
-                    # 运动不一致：要求更高的外观相似度
+                if not motion_consistent or depth_penalty > 0:
+                    # 运动不一致或深度方向矛盾：要求更高的外观相似度
                     if similarity > 0.85 and center_dist < search_radius * 0.5 and scale_penalty < 0.3:
                         is_match = True
                 elif scale_penalty > 0.3:
@@ -924,8 +1469,8 @@ class AdvancedTracker:
                         is_match = True
                 
                 if is_match:
-                    # 综合代价：外观 + 空间 + 运动惩罚 + 尺度惩罚
-                    cost = (1 - similarity) * 0.4 + (1 - spatial_confidence) * 0.25 + motion_penalty * 0.2 + scale_penalty * 0.15
+                    # 综合代价：外观 + 空间 + 运动惩罚 + 尺度惩罚 + 深度惩罚
+                    cost = (1 - similarity) * 0.35 + (1 - spatial_confidence) * 0.2 + motion_penalty * 0.2 + scale_penalty * 0.15 + depth_penalty * 0.1
                     cost_matrix[i, j] = cost
         
         # 使用匈牙利算法全局最优匹配
@@ -972,17 +1517,17 @@ class AdvancedTracker:
         # 更新场景统计
         self.scene_stats['num_detections'] = num_detections
         
-        # 密集场景
+        # 密集场景：外观更重要
         if num_detections > self.config.density_threshold_high:
             self.adaptive_params['iou_threshold'] = 0.4
-            self.adaptive_params['appearance_weight'] = 0.5
-            self.adaptive_params['iou_weight'] = 0.2
+            self.adaptive_params['appearance_weight'] = 0.55
+            self.adaptive_params['iou_weight'] = 0.15
         
-        # 稀疏场景
+        # 稀疏场景：IoU更可靠，但仍以外观为主
         elif num_detections < self.config.density_threshold_low:
             self.adaptive_params['iou_threshold'] = 0.2
-            self.adaptive_params['appearance_weight'] = 0.3
-            self.adaptive_params['iou_weight'] = 0.5
+            self.adaptive_params['appearance_weight'] = 0.4
+            self.adaptive_params['iou_weight'] = 0.3
         
         else:
             self.adaptive_params['iou_threshold'] = self.config.iou_threshold
