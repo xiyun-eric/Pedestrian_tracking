@@ -47,7 +47,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 MODEL_PATH = PROJECT_ROOT / "Qwen"
 MOT17_PATH = PROJECT_ROOT / "data" / "MOT17"
-OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_DIR = PROJECT_ROOT / "runs"
 ABLATION_DIR = OUTPUT_DIR / "ablation"
 
 # 修复 Windows GBK 编码问题
@@ -73,7 +73,7 @@ ABLATION_CONFIGS = OrderedDict([
         'name': 'A1_no_lora',
         'desc': '无 LoRA (原始模型) - 验证 LoRA 的必要性',
         'lora_path': None,  # 原始模型
-        'baseline': 'output/stage2/final',  # 对比基线
+        'baseline': 'runs/stage2/final',  # 对比基线
         'train_needed': False,
     }),
 
@@ -259,7 +259,7 @@ def run_training(config, full=False, dry_run=False):
             return False
 
         # 训练完成后, 复制权重到目标路径 (如果不在目标路径)
-        # train.py 默认保存到 output/stage{N}/final
+        # train.py 默认保存到 runs/stage{N}/final
         # 消融实验需要保存到 ablation/{name}/final
         default_save = OUTPUT_DIR / 'stage1' / 'final'
         if default_save.exists() and not lora_path.exists():

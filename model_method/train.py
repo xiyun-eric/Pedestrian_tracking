@@ -33,7 +33,7 @@ from transformers import (
 from peft import get_peft_model, prepare_model_for_kbit_training, PeftModel
 MODEL_PATH = PROJECT_ROOT / "Qwen"
 DATA_DIR = PROJECT_ROOT / "data"
-OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_DIR = PROJECT_ROOT / "runs"
 
 # 数据文件映射:
 # Stage 1 (SFT) 使用单帧检测数据 (原生 Qwen2-VL 格式, 利用模型已有检测能力)

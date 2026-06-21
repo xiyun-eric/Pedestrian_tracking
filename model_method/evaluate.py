@@ -13,19 +13,19 @@ Phase 5: MOT 标准评估
 
 使用方式:
   # 推理并评估指定 LoRA 权重
-  python model_method/evaluate.py --lora-path output/stage1/final
+  python model_method/evaluate.py --lora-path runs/stage1/final
 
   # 评估原始模型 (无 LoRA)
   python model_method/evaluate.py --no-lora
 
   # 快速模式 (只评估前 20 帧)
-  python model_method/evaluate.py --lora-path output/stage1/final --quick
+  python model_method/evaluate.py --lora-path runs/stage1/final --quick
 
   # 只评估已有结果文件 (不重新推理)
-  python model_method/evaluate.py --eval-only --result-dir output/mot_results
+  python model_method/evaluate.py --eval-only --result-dir runs/mot_results
 
   # 指定序列和窗口参数
-  python model_method/evaluate.py --lora-path output/stage1/final \
+  python model_method/evaluate.py --lora-path runs/stage1/final \
       --sequences MOT17-02-FRCNN --window-size 2 --stride 1
 """
 
@@ -47,7 +47,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 MODEL_PATH = PROJECT_ROOT / "Qwen"
 MOT17_PATH = PROJECT_ROOT / "data" / "MOT17"
-OUTPUT_DIR = PROJECT_ROOT / "output"
+OUTPUT_DIR = PROJECT_ROOT / "runs"
 
 # 修复 Windows GBK 编码问题
 if sys.stdout.encoding != 'utf-8':
@@ -697,7 +697,7 @@ def main():
     parser = argparse.ArgumentParser(description="Phase 5: MOT 标准评估")
     parser.add_argument(
         '--lora-path', type=str, default=None,
-        help='LoRA 权重路径 (不指定且未 --no-lora 则使用 output/stage1/final)'
+        help='LoRA 权重路径 (不指定且未 --no-lora 则使用 runs/stage1/final)'
     )
     parser.add_argument(
         '--no-lora', action='store_true',

@@ -3,12 +3,23 @@
 
 统一调度三种方法，收集结果，调用对比模块生成报告。
 
+三种对比方法:
+  (i)   传统方法 (HOG+SVM + Kalman)        - traditional
+  (ii)  微调后的深度方法 (YOLO11+LoRA)      - deep_custom
+  (iii) 大模型方法 (Qwen2-VL+LoRA+IoU跟踪) - large_model
+
 使用方法:
-  # 对所有视频运行所有方法（scene5有GT标注）
-  python run_comparison.py --videos-scenes scene1 scene2 scene3 scene4 scene5 --frames 150
+  # MOT17 模式: 对 02, 04, 11 三个场景运行三种方法，只评估前 10 帧
+  python run_comparison.py --mot17
+  
+  # 自定义场景和帧数
+  python run_comparison.py --mot17 --mot17-seq MOT17-02-FRCNN MOT17-04-FRCNN MOT17-11-FRCNN --mot17-frames 10
   
   # 只运行特定方法
-  python run_comparison.py --videos-scenes scene5 --methods traditional --frames 100
+  python run_comparison.py --mot17 --methods traditional large_model
+  
+  # 自收集视频模式 (原有逻辑)
+  python run_comparison.py --videos-scenes scene1 scene2 scene3 scene4 scene5 --frames 150
 """
 
 import sys
@@ -273,6 +284,122 @@ def run_deep_method(video_path: Path, scene_name: str,
     }
 
 
+def run_large_model_method(seq_names: List[str], frames: int,
+                           output_dir: Optional[Path] = None) -> Dict[str, Dict]:
+    """
+    运行大模型方法 (Qwen2-VL + LoRA + IoU 后处理跟踪)
+
+    通过调用 model_method/visualize.py --mode detect_track 完成。
+    visualize.py 会输出 evaluation_report.json，其中包含 'overall' 和 'per_sequence' 字段。
+
+    Args:
+        seq_names: MOT17 序列名称列表
+        frames: 每个序列处理帧数
+        output_dir: 大模型可视化输出目录
+
+    Returns:
+        {seq_name: metrics_dict} 每个序列的指标字典
+    """
+    if output_dir is None:
+        output_dir = _project_root / "outputs" / "large_model"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # LoRA 权重路径 (训练结果已迁移至 runs/)
+    lora_path = _project_root / "runs" / "stage1" / "final"
+    if not lora_path.exists():
+        # 兼容旧路径 output/stage1/final
+        legacy_lora = _project_root / "output" / "stage1" / "final"
+        if legacy_lora.exists():
+            lora_path = legacy_lora
+        else:
+            print(f"[警告] LoRA 权重不存在: {lora_path} (也无旧路径 {legacy_lora})")
+            return {seq: {"method": "大模型方法 (Qwen2-VL+LoRA)", "scene": seq,
+                          "MOTA": "N/A", "MOTP": "N/A", "IDF1": "N/A", "IDSW": "N/A",
+                          "FPS": 0.0} for seq in seq_names}
+
+    # 序列过滤参数
+    seq_filter = ",".join(seq_names)
+
+    cmd = [
+        sys.executable,
+        str(_project_root / "model_method" / "visualize.py"),
+        "--mode", "detect_track",
+        "--lora-path", str(lora_path),
+        "--output-dir", str(output_dir),
+        "--seq-filter", seq_filter,
+        "--max-frames", str(frames),
+    ]
+
+    print(f"\n{'='*70}")
+    print(f"  大模型方法 (Qwen2-VL+LoRA): 序列={seq_names} 帧数={frames}")
+    print(f"{'='*70}")
+
+    # 实时显示子进程输出
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        cwd=_project_root
+    )
+
+    output_lines = []
+    while True:
+        line = process.stdout.readline()
+        if not line and process.poll() is not None:
+            break
+        if line:
+            print(line, end='')
+            output_lines.append(line)
+
+    process.wait(timeout=3600)  # 大模型推理较慢，给 1 小时
+    stdout = ''.join(output_lines)
+    stderr = ""
+
+    stats = _extract_stats_from_output(stdout, stderr)
+
+    if process.returncode != 0:
+        print(f"[警告] 大模型方法运行有错误 (returncode={process.returncode})")
+
+    # 读取 visualize.py 输出的 evaluation_report.json
+    # visualize_detect_track 函数会在 output_dir 下创建 track_detect_iou 子目录
+    report_path = output_dir / "track_detect_iou" / "evaluation_report.json"
+    per_seq_metrics = {}
+    if report_path.exists():
+        with open(report_path, 'r', encoding='utf-8') as f:
+            report = json.load(f)
+        per_seq_data = report.get('per_sequence', {})
+        for seq_name in seq_names:
+            if seq_name in per_seq_data:
+                m = per_seq_data[seq_name]
+                m["FPS"] = stats.get("fps", 0.0)
+                m["method"] = "大模型方法 (Qwen2-VL+LoRA)"
+                m["scene"] = seq_name
+                per_seq_metrics[seq_name] = m
+            else:
+                per_seq_metrics[seq_name] = {
+                    "method": "大模型方法 (Qwen2-VL+LoRA)", "scene": seq_name,
+                    "FPS": stats.get("fps", 0.0),
+                    "MOTA": "N/A", "MOTP": "N/A", "IDF1": "N/A", "IDSW": "N/A",
+                    "FP": "N/A", "FN": "N/A", "TP": "N/A", "GT": "N/A",
+                    "Precision": "N/A", "Recall": "N/A",
+                }
+    else:
+        print(f"[警告] 未找到大模型评估报告: {report_path}")
+        for seq_name in seq_names:
+            per_seq_metrics[seq_name] = {
+                "method": "大模型方法 (Qwen2-VL+LoRA)", "scene": seq_name,
+                "FPS": stats.get("fps", 0.0),
+                "MOTA": "N/A", "MOTP": "N/A", "IDF1": "N/A", "IDSW": "N/A",
+                "FP": "N/A", "FN": "N/A", "TP": "N/A", "GT": "N/A",
+                "Precision": "N/A", "Recall": "N/A",
+            }
+
+    return per_seq_metrics
+
+
 def _extract_stats_from_output(stdout: str, stderr: str) -> Dict:
     """从输出文本中提取FPS等统计信息"""
     stats = {}
@@ -355,7 +482,7 @@ def main():
                         default=['scene1', 'scene2', 'scene3', 'scene4', 'scene5'],
                         help='要测试的场景名称列表 (scene1, scene2, ...)')
     parser.add_argument('--methods', type=str, nargs='+',
-                        choices=['traditional', 'deep_pretrained', 'deep_custom', 'all'],
+                        choices=['traditional', 'deep_pretrained', 'deep_custom', 'large_model', 'all'],
                         default=['all'],
                         help='要运行的方法')
     parser.add_argument('--frames', type=int, default=DEFAULT_FRAMES,
@@ -372,8 +499,13 @@ def main():
                         help='使用MOT17数据集模式')
     parser.add_argument('--mot17-dir', type=str, default='data/MOT17',
                         help='MOT17数据集根目录')
-    parser.add_argument('--mot17-seq', type=str, nargs='+', default=None,
-                        help='MOT17序列名称（如MOT17-04-FRCNN），不指定则自动发现所有序列')
+    parser.add_argument('--mot17-seq', type=str, nargs='+',
+                        default=['MOT17-02-FRCNN', 'MOT17-04-FRCNN', 'MOT17-11-FRCNN'],
+                        help='MOT17序列名称（默认: 02, 04, 11 三个场景）')
+    parser.add_argument('--mot17-frames', type=int, default=10,
+                        help='MOT17模式每个序列处理帧数 (默认: 10，避免评估时间过长)')
+    parser.add_argument('--large-model-output', type=str, default='outputs/large_model',
+                        help='大模型方法可视化输出目录')
     parser.add_argument('--use-hog-api', action="store_true", default=True,
                         help="传统方法HOG特征提取使用OpenCV API（默认开启）")
     parser.add_argument('--no-hog-api', action="store_true",
@@ -391,7 +523,8 @@ def main():
 
     # 确定要运行的方法
     if 'all' in args.methods:
-        methods_to_run = ['traditional', 'deep_pretrained', 'deep_custom']
+        # 默认对比三种方法: 传统HOG、微调深度方法、大模型方案
+        methods_to_run = ['traditional', 'deep_custom', 'large_model']
     else:
         methods_to_run = args.methods
 
@@ -588,9 +721,10 @@ def main():
     # MOT17数据集模式
     if args.mot17:
         mot17_dir = Path(args.mot17_dir)
-        frames = args.frames
+        # MOT17 模式使用 --mot17-frames (默认 10 帧，避免评估时间过长)
+        frames = args.mot17_frames
 
-        # 自动发现序列
+        # 自动发现序列 (默认使用 02, 04, 11 三个场景)
         if args.mot17_seq:
             seq_names = args.mot17_seq
         else:
@@ -775,6 +909,15 @@ def main():
                     reporter.add_result("深度方法 (微调)", seq_name,
                         {"method": "深度方法 (微调)", "scene": seq_name,
                          "FPS": stats.get("fps", 0.0), "MOTA": "N/A", "MOTP": "N/A"})
+
+        # 大模型方法 (Qwen2-VL + LoRA)
+        # 注意: 大模型方法通过 visualize.py 一次性处理所有序列，
+        # 因此放在 per-sequence 循环之外
+        if 'large_model' in methods_to_run:
+            large_model_output = Path(args.large_model_output)
+            per_seq_metrics = run_large_model_method(seq_names, frames, large_model_output)
+            for seq_name, metrics in per_seq_metrics.items():
+                reporter.add_result(metrics["method"], seq_name, metrics)
 
         # 生成对比报告（MOT17模式）
         print(f"\n{'='*70}")

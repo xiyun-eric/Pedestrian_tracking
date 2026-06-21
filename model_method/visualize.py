@@ -8,7 +8,7 @@ Phase 3.5: 训练前模型推理可视化
   python model_method/visualize.py --mode detect
   python model_method/visualize.py --mode track
   python model_method/visualize.py --mode track10
-  python model_method/visualize.py --mode compare --lora-path output/stage1/final
+  python model_method/visualize.py --mode compare --lora-path runs/stage1/final
 """
 
 import os
@@ -30,7 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 MODEL_PATH = PROJECT_ROOT / "Qwen"
 MOT17_PATH = PROJECT_ROOT / "data" / "MOT17"
-OUTPUT_DIR = PROJECT_ROOT / "output" / "visualizations"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "visualizations"
 
 # 评估参数 (由 main() 设置)
 EVAL_SEQ_FILTER = None  # 只测试指定序列, 如 ['MOT17-02-FRCNN', 'MOT17-11-FRCNN']
@@ -1387,6 +1387,9 @@ def visualize_detect_match(model, processor, output_dir):
 
     total_tp, total_fp, total_fn = 0, 0, 0
     total_gt_count, total_pred_count = 0, 0
+    # MOT 格式预测结果: {frame_id: {track_id: [x1,y1,x2,y2]}}
+    mot_predictions = {}
+    mot_confidences = {}
 
     for seq_name in sorted(os.listdir(seq_dir)):
         seq_path = seq_dir / seq_name
@@ -1463,6 +1466,15 @@ def visualize_detect_match(model, processor, output_dir):
             pred_bboxes_pixel = pred_bboxes_nms
             pred_ids = nms_ids
 
+            # 收集 MOT 格式预测 (1-based frame_id)
+            mot_predictions[frame_id] = {}
+            mot_confidences[frame_id] = {}
+            for k, bbox in enumerate(pred_bboxes_pixel):
+                tid = pred_ids[k]
+                x1, y1, x2, y2 = bbox
+                mot_predictions[frame_id][tid] = np.array([x1, y1, x2, y2], dtype=np.float32)
+                mot_confidences[frame_id][tid] = 1.0
+
             # 计算IoU
             frame_ious = []
             for pred_bbox in pred_bboxes_pixel:
@@ -1508,7 +1520,7 @@ def visualize_detect_match(model, processor, output_dir):
             print(f"    帧{frame_id}: GT={len(gt_bboxes_pixel)}, Pred={len(pred_bboxes_pixel)}, "
                   f"TP={tp}, FP={fp}, FN={fn}, 平均IoU={avg_iou:.3f}")
 
-        # 绘制逐帧对比图
+        # 绘制逐帧对比图 (GT 和 Pred 左右拼接)
         import colorsys
         seq_out_dir = output_dir / seq_name
         seq_out_dir.mkdir(parents=True, exist_ok=True)
@@ -1531,23 +1543,73 @@ def visualize_detect_match(model, processor, output_dir):
 
         for fd in all_frame_data:
             image = Image.open(fd['image_path']).convert("RGB")
-            draw = ImageDraw.Draw(image)
 
-            # 绘制GT (绿色)
-            for bbox in fd['gt_bboxes']:
-                draw.rectangle(list(bbox), outline='green', width=2)
+            # GT 图 (绿色) - 左侧
+            gt_image = image.copy()
+            gt_draw = ImageDraw.Draw(gt_image)
+            for gi, bbox in enumerate(fd['gt_bboxes']):
+                gt_draw.rectangle(list(bbox), outline='green', width=2)
+                gid = fd['gt_ids'][gi]
+                gt_draw.text((bbox[0], bbox[1] - 14), f"GT{gid}", fill='green', font=font)
 
-            # 绘制Pred (按ID着色)
+            # Pred 图 (按ID着色) - 右侧
+            pred_image = image.copy()
+            pred_draw = ImageDraw.Draw(pred_image)
             for pi, bbox in enumerate(fd['pred_bboxes']):
                 tid = fd['pred_ids'][pi]
                 color = id_colors.get(tid, 'red')
-                draw.rectangle(list(bbox), outline=color, width=2)
-                draw.text((bbox[0], bbox[1] - 12), f"ID{tid}", fill=color, font=font)
+                pred_draw.rectangle(list(bbox), outline=color, width=2)
+                pred_draw.text((bbox[0], bbox[1] - 14), f"ID{tid}", fill=color, font=font)
+
+            # 左右拼接
+            combined = Image.new('RGB', (img_width * 2 + 20, img_height + 40), 'white')
+            combined.paste(gt_image, (0, 0))
+            combined.paste(pred_image, (img_width + 20, 0))
+
+            c_draw = ImageDraw.Draw(combined)
+            try:
+                c_font = ImageFont.truetype("arial.ttf", 20)
+            except:
+                c_font = ImageFont.load_default()
+            avg_iou = np.mean(fd['ious']) if fd['ious'] else 0.0
+            c_draw.text((10, img_height + 5),
+                       f"GT (Green) - {len(fd['gt_bboxes'])} persons",
+                       fill='green', font=c_font)
+            c_draw.text((img_width + 30, img_height + 5),
+                       f"Pred (Colored) - {len(fd['pred_bboxes'])} persons, avgIoU={avg_iou:.3f}",
+                       fill='red', font=c_font)
 
             save_path = seq_out_dir / f"frame{fd['frame_id']:06d}.jpg"
-            image.save(str(save_path), quality=90)
+            combined.save(str(save_path), quality=90)
 
         print(f"    逐帧对比图保存: {seq_out_dir}")
+
+    # 使用 TrackingEvaluator 计算标准 MOT 指标
+    from tools.evaluate import TrackingEvaluator
+    evaluator = TrackingEvaluator(iou_threshold=0.5)
+    # 加载 GT (所有序列)
+    gt_all = {}
+    for seq_name in sorted(os.listdir(seq_dir)):
+        seq_path = seq_dir / seq_name
+        if not seq_path.is_dir():
+            continue
+        if EVAL_SEQ_FILTER and seq_name not in EVAL_SEQ_FILTER:
+            continue
+        gt_path = seq_path / "gt" / "gt.txt"
+        if gt_path.exists():
+            gt = evaluator.load_mot_gt(gt_path, class_ids=[1])
+            gt_all.update(gt)
+
+    # 计算标准 MOT 指标
+    metrics_obj = evaluator.evaluate(mot_predictions, gt_all, eval_mode="prediction_range")
+    metrics = metrics_obj.to_dict()
+
+    # 保存 MOT 格式预测结果
+    evaluator.save_predictions_mot(mot_predictions, str(output_dir / "predictions.txt"), mot_confidences)
+
+    # 保存评估报告
+    with open(str(output_dir / "evaluation_report.json"), 'w', encoding='utf-8') as f:
+        json.dump(metrics, f, indent=2, ensure_ascii=False)
 
     # 汇总
     print("\n" + "=" * 60)
@@ -1564,6 +1626,11 @@ def visualize_detect_match(model, processor, output_dir):
     print(f"\n  精确率 (Precision): {precision*100:.1f}%")
     print(f"  召回率 (Recall): {recall*100:.1f}%")
     print(f"  F1 分数: {f1*100:.1f}%")
+    print(f"\n  标准 MOT 指标:")
+    print(f"  MOTA: {metrics['MOTA']*100:.1f}%")
+    print(f"  MOTP: {metrics['MOTP']*100:.1f}%")
+    print(f"  IDF1: {metrics['IDF1']*100:.1f}%")
+    print(f"  IDSW: {metrics['IDSW']}")
 
     print(f"\n可视化结果保存在: {output_dir}")
 
@@ -1595,6 +1662,9 @@ def visualize_detect_track(model, processor, output_dir):
     total_gt_count, total_pred_count = 0, 0
     total_idsw = 0  # ID 切换次数
     total_id_match_count = 0  # ID 匹配总数 (用于计算 ID 保持率)
+    # 每序列预测结果和指标 (避免跨序列 frame_id 冲突)
+    per_sequence_data = {}  # {seq_name: {'predictions': {...}, 'confidences': {...}}}
+    per_sequence_metrics = {}  # {seq_name: {metrics dict}}
 
     for seq_name in sorted(os.listdir(seq_dir)):
         seq_path = seq_dir / seq_name
@@ -1636,6 +1706,9 @@ def visualize_detect_track(model, processor, output_dir):
 
         # 为每帧构建 GT 和 Pred 的 bbox 列表
         all_frame_data = []
+        # 当前序列的 MOT 格式预测
+        seq_predictions = {}
+        seq_confidences = {}
 
         # 用于计算 IDSW: 记录每个 GT track_id 在上一帧匹配的 pred_id
         prev_gt_to_pred = {}  # {gt_id: pred_id}
@@ -1662,6 +1735,15 @@ def visualize_detect_track(model, processor, output_dir):
                     px1, py1, px2, py2 = qwen_bbox_to_pixel(x1, y1, x2, y2, img_width, img_height)
                     pred_bboxes_pixel.append((px1, py1, px2, py2))
                     pred_ids.append(frame_ids[i][k])
+
+            # 收集当前序列的 MOT 格式预测
+            seq_predictions[frame_id] = {}
+            seq_confidences[frame_id] = {}
+            for k, bbox in enumerate(pred_bboxes_pixel):
+                tid = pred_ids[k]
+                x1, y1, x2, y2 = bbox
+                seq_predictions[frame_id][tid] = np.array([x1, y1, x2, y2], dtype=np.float32)
+                seq_confidences[frame_id][tid] = 1.0
 
             # TP/FP/FN (IoU 阈值=0.5)
             matched_gt = set()
@@ -1713,10 +1795,29 @@ def visualize_detect_track(model, processor, output_dir):
             print(f"    帧{frame_id}: GT={len(gt_bboxes_pixel)}, Pred={len(pred_bboxes_pixel)}, "
                   f"TP={tp}, FP={fp}, FN={fn}")
 
-        # 绘制逐帧对比图
-        import colorsys
+        # 计算当前序列的标准 MOT 指标
+        from tools.evaluate import TrackingEvaluator
+        evaluator = TrackingEvaluator(iou_threshold=0.5)
+        seq_gt = evaluator.load_mot_gt(gt_path, class_ids=[1])
+        seq_metrics_obj = evaluator.evaluate(seq_predictions, seq_gt, eval_mode="prediction_range")
+        seq_metrics = seq_metrics_obj.to_dict()
+        per_sequence_metrics[seq_name] = seq_metrics
+        per_sequence_data[seq_name] = {
+            'predictions': seq_predictions,
+            'confidences': seq_confidences,
+        }
+
+        # 保存当前序列的 MOT 格式预测
         seq_out_dir = output_dir / seq_name
         seq_out_dir.mkdir(parents=True, exist_ok=True)
+        evaluator.save_predictions_mot(
+            seq_predictions,
+            str(seq_out_dir / "predictions.txt"),
+            seq_confidences,
+        )
+
+        # 绘制逐帧对比图 (GT 和 Pred 左右拼接)
+        import colorsys
 
         # 为 pred track ID 生成颜色
         all_pred_ids = set()
@@ -1736,25 +1837,82 @@ def visualize_detect_track(model, processor, output_dir):
 
         for fd in all_frame_data:
             image = Image.open(fd['image_path']).convert("RGB")
-            draw = ImageDraw.Draw(image)
 
-            # 绘制 GT (绿色)
+            # GT 图 (绿色) - 左侧
+            gt_image = image.copy()
+            gt_draw = ImageDraw.Draw(gt_image)
             for gi, bbox in enumerate(fd['gt_bboxes']):
-                draw.rectangle(list(bbox), outline='green', width=2)
+                gt_draw.rectangle(list(bbox), outline='green', width=2)
                 gid = fd['gt_ids'][gi]
-                draw.text((bbox[0], bbox[1] - 12), f"GT{gid}", fill='green', font=font)
+                gt_draw.text((bbox[0], bbox[1] - 14), f"GT{gid}", fill='green', font=font)
 
-            # 绘制 Pred (按 ID 着色)
+            # Pred 图 (按 ID 着色) - 右侧
+            pred_image = image.copy()
+            pred_draw = ImageDraw.Draw(pred_image)
             for pi, bbox in enumerate(fd['pred_bboxes']):
                 tid = fd['pred_ids'][pi]
                 color = id_colors.get(tid, 'red')
-                draw.rectangle(list(bbox), outline=color, width=2)
-                draw.text((bbox[0], bbox[1] - 12), f"ID{tid}", fill=color, font=font)
+                pred_draw.rectangle(list(bbox), outline=color, width=2)
+                pred_draw.text((bbox[0], bbox[1] - 14), f"ID{tid}", fill=color, font=font)
+
+            # 左右拼接
+            combined = Image.new('RGB', (img_width * 2 + 20, img_height + 40), 'white')
+            combined.paste(gt_image, (0, 0))
+            combined.paste(pred_image, (img_width + 20, 0))
+
+            c_draw = ImageDraw.Draw(combined)
+            try:
+                c_font = ImageFont.truetype("arial.ttf", 20)
+            except:
+                c_font = ImageFont.load_default()
+            c_draw.text((10, img_height + 5),
+                       f"GT (Green) - {len(fd['gt_bboxes'])} persons",
+                       fill='green', font=c_font)
+            c_draw.text((img_width + 30, img_height + 5),
+                       f"Pred (Colored) - {len(fd['pred_bboxes'])} persons",
+                       fill='red', font=c_font)
 
             save_path = seq_out_dir / f"frame{fd['frame_id']:06d}.jpg"
-            image.save(str(save_path), quality=90)
+            combined.save(str(save_path), quality=90)
 
         print(f"    逐帧对比图保存: {seq_out_dir}")
+
+    # 计算汇总指标 (从 per-sequence 累加)
+    total_metrics = {
+        'MOTA': 0.0, 'MOTP': 0.0, 'IDF1': 0.0,
+        'IDSW': 0, 'FP': 0, 'FN': 0, 'TP': 0, 'GT': 0,
+        'MT': 0, 'ML': 0, 'Frag': 0,
+        'num_frames': 0, 'num_gt_ids': 0, 'num_pred_ids': 0,
+    }
+    motp_weighted_sum = 0.0  # MOTP 加权平均 (按 TP 加权)
+    motp_total_tp = 0
+    for seq_name, seq_m in per_sequence_metrics.items():
+        for k in total_metrics:
+            if isinstance(total_metrics[k], (int, float)):
+                total_metrics[k] += seq_m.get(k, 0)
+        # MOTP 按 TP 加权
+        motp_weighted_sum += seq_m.get('MOTP', 0) * seq_m.get('TP', 0)
+        motp_total_tp += seq_m.get('TP', 0)
+    # 重新计算 MOTA (基于累加的 FP/FN/IDSW/GT)
+    if total_metrics['GT'] > 0:
+        total_metrics['MOTA'] = 1 - (total_metrics['FP'] + total_metrics['FN'] + total_metrics['IDSW']) / total_metrics['GT']
+    # MOTP 加权平均
+    if motp_total_tp > 0:
+        total_metrics['MOTP'] = motp_weighted_sum / motp_total_tp
+    # IDF1 简单平均
+    if per_sequence_metrics:
+        total_metrics['IDF1'] = sum(m.get('IDF1', 0) for m in per_sequence_metrics.values()) / len(per_sequence_metrics)
+    # Precision/Recall
+    total_metrics['Precision'] = total_metrics['TP'] / max(total_metrics['TP'] + total_metrics['FP'], 1)
+    total_metrics['Recall'] = total_metrics['TP'] / max(total_metrics['TP'] + total_metrics['FN'], 1)
+
+    # 保存评估报告 (包含 per-sequence 和汇总)
+    report = {
+        'overall': total_metrics,
+        'per_sequence': per_sequence_metrics,
+    }
+    with open(str(output_dir / "evaluation_report.json"), 'w', encoding='utf-8') as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
 
     # 汇总
     print("\n" + "=" * 60)
@@ -1775,6 +1933,18 @@ def visualize_detect_track(model, processor, output_dir):
     if total_id_match_count > 0:
         id_keep_rate = (total_id_match_count - total_idsw) / total_id_match_count * 100
         print(f"  ID 保持率: {id_keep_rate:.1f}% ({total_id_match_count - total_idsw}/{total_id_match_count})")
+    print(f"\n  标准 MOT 指标 (汇总):")
+    print(f"  MOTA: {total_metrics['MOTA']*100:.1f}%")
+    print(f"  MOTP: {total_metrics['MOTP']*100:.1f}%")
+    print(f"  IDF1: {total_metrics['IDF1']*100:.1f}%")
+    print(f"  IDSW (标准): {total_metrics['IDSW']}")
+
+    # 打印 per-sequence 指标
+    print(f"\n  Per-sequence 指标:")
+    for seq_name, seq_m in per_sequence_metrics.items():
+        print(f"    {seq_name}: MOTA={seq_m['MOTA']*100:.1f}%, MOTP={seq_m['MOTP']*100:.1f}%, "
+              f"IDF1={seq_m['IDF1']*100:.1f}%, IDSW={seq_m['IDSW']}, "
+              f"TP={seq_m['TP']}, FP={seq_m['FP']}, FN={seq_m['FN']}")
 
     print(f"\n可视化结果保存在: {output_dir}")
 
@@ -1803,12 +1973,12 @@ def main():
         help='输出目录'
     )
     parser.add_argument(
-        '--seq-filter', type=str, default=None,
-        help='只测试指定序列，逗号分隔，如 "MOT17-02-FRCNN,MOT17-11-FRCNN"'
+        '--seq-filter', type=str, default='MOT17-02-FRCNN,MOT17-11-FRCNN',
+        help='只测试指定序列，逗号分隔 (默认: MOT17-02-FRCNN,MOT17-11-FRCNN)'
     )
     parser.add_argument(
-        '--max-frames', type=int, default=None,
-        help='每个序列最多测试的帧数 (默认: 不限制)'
+        '--max-frames', type=int, default=10,
+        help='每个序列最多测试的帧数 (默认: 10)'
     )
     args = parser.parse_args()
 
