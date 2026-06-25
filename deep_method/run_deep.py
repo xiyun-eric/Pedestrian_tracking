@@ -61,7 +61,9 @@ def main():
     parser.add_argument("--model", type=str, default="yolo11m.pt",
                        help="YOLO模型 (yolo11n/s/m/l, yolo11m.pt)")
     parser.add_argument("--lora", type=str, default=None,
-                       help="LoRA权重路径")
+                       help="YOLO LoRA权重路径")
+    parser.add_argument("--reid-lora", type=str, default=None,
+                       help="ReID LoRA权重路径 (如 runs/reid/osnet_lora/lora_best.pt)")
     parser.add_argument("--device", type=str, default="cuda:0",
                        help="推理设备")
 
@@ -105,6 +107,7 @@ def main():
         min_hits=args.min_hits,
         track_iou_threshold=args.track_iou,
         lora_path=args.lora,
+        reid_lora_path=args.reid_lora,
         save_video=not args.no_video,
         draw_trajectory=not args.no_trajectory,
     )
@@ -118,13 +121,16 @@ def main():
     print(f"  检测器: YOLO11 ({Path(args.model).stem})")
     print(f"  跟踪器: AdvancedTracker + ByteTrack + ReID")
     print(f"  ByteTrack: {'启用' if config.use_bytetrack else '禁用'}")
-    print(f"  LoRA微调: {'已加载' if args.lora else '未使用'}")
+    print(f"  YOLO LoRA: {'已加载' if args.lora else '未使用'}")
+    print(f"  ReID LoRA: {'已加载' if args.reid_lora else '未使用'}")
     print(f"  设备: {args.device}")
     print(f"  输入: {'视频文件' if use_video_mode else '图像序列'}")
     print("=" * 70)
 
     if args.lora:
-        print(f"\n[已加载LoRA权重] {args.lora}")
+        print(f"\n[已加载YOLO LoRA权重] {args.lora}")
+    if args.reid_lora:
+        print(f"[已加载ReID LoRA权重] {args.reid_lora}")
 
     total_stats = []
 

@@ -58,6 +58,14 @@ def main():
                        help="HOG检测置信度阈值")
     parser.add_argument("--hog-scale", type=float, default=1.05,
                        help="HOG图像金字塔缩放系数(<1.05更精细)")
+    parser.add_argument("--win-stride", type=int, default=8,
+                       help="HOG滑动窗口步长(4更密检测更多)")
+    parser.add_argument("--nms-threshold", type=float, default=0.45,
+                       help="HOG NMS IoU阈值(越大保留越多重叠框)")
+    parser.add_argument("--aspect-min", type=float, default=0.2,
+                       help="行人最小宽高比(越小包容越宽的目标)")
+    parser.add_argument("--aspect-max", type=float, default=0.85,
+                       help="行人最大宽高比(越大包容越高瘦或倾斜的目标)")
     parser.add_argument("--use-hog-api", action="store_true", default=True,
                        help="HOG特征提取使用OpenCV API（默认开启，速度快）")
     parser.add_argument("--no-hog-api", action="store_true",
@@ -65,7 +73,15 @@ def main():
     parser.add_argument("--use-svm-api", action="store_true", default=True,
                        help="SVM使用OpenCV预训练权重（默认开启）")
     parser.add_argument("--no-svm-api", action="store_true",
-                       help="SVM不使用OpenCV预训练权重（仅用于标识，决策函数始终手动实现）")
+                       help="SVM不使用OpenCV预训练权重")
+
+    # 速度优化参数
+    parser.add_argument("--roi-ratio", type=float, default=1.0,
+                       help="ROI检测比例(0.5=仅下半部, 加速且减少FP)")
+    parser.add_argument("--frame-skip", type=int, default=1,
+                       help="跳帧检测(2=隔帧, 2x加速)")
+    parser.add_argument("--input-scale", type=float, default=1.0,
+                       help="输入缩放(0.75=缩至75%%, 2-3x加速)")
 
     # 跟踪参数
     parser.add_argument("--max-age", type=int, default=30,
@@ -111,8 +127,15 @@ def main():
     config = TraditionalTrackingConfig(
         hog_conf_threshold=args.hog_conf,
         hog_scale=args.hog_scale,
+        hog_win_stride=args.win_stride,
+        hog_nms_threshold=args.nms_threshold,
+        hog_aspect_min=args.aspect_min,
+        hog_aspect_max=args.aspect_max,
         use_hog_api=use_hog_api,
         use_svm_api=use_svm_api,
+        roi_ratio=args.roi_ratio,
+        frame_skip=args.frame_skip,
+        input_scale=args.input_scale,
         max_age=args.max_age,
         min_hits=args.min_hits,
         iou_threshold=args.iou_threshold,

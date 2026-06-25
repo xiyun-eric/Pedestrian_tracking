@@ -63,6 +63,7 @@ class DeepTrackingConfig:
     # ReID 参数
     use_reid: bool = True
     reid_model: str = "osnet_x1_0"
+    reid_lora_path: Optional[str] = None  # ReID LoRA 权重路径
     
     # LoRA
     lora_path: Optional[str] = None
@@ -129,6 +130,7 @@ class DeepTrackingPipeline:
             self.reid_extractor = ReIDExtractor(
                 model_name=self.config.reid_model,
                 device=self.config.device,
+                weights_path=self.config.reid_lora_path,
             )
         else:
             self.reid_extractor = None

@@ -200,6 +200,12 @@ class YOLODetector:
         """
         from model.lora_layers import load_lora_weights, inject_lora_to_yolo
         
+        # 先融合 BN 层（必须在注入 LoRA 之前，否则 predict 时再次融合会冲突）
+        try:
+            self.model.model = self.model.model.fuse(verbose=False)
+        except Exception:
+            pass  # 已融合或无需融合
+        
         # 注入 LoRA 结构
         self.model.model, _ = inject_lora_to_yolo(
             self.model.model, r=8, alpha=16.0, verbose=False

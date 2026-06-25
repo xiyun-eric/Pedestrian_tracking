@@ -273,6 +273,8 @@ class HOGDetector:
         split_merged_boxes: bool = True,
         use_hog_api: bool = True,   # HOG是否使用OpenCV API
         use_svm_api: bool = True,   # SVM是否使用OpenCV预训练权重
+        roi_ratio: float = 1.0,     # ROI检测比例 (0.5=下半部)
+        input_scale: float = 1.0,   # 输入缩放系数 (0.75=75%)
     ):
         """
         Args:
@@ -287,8 +289,10 @@ class HOGDetector:
             aspect_ratio_min: 行人最小宽高比
             aspect_ratio_max: 行人最大宽高比
             split_merged_boxes: 是否拆分融合框
-            use_hog_api: HOG特征提取是否使用OpenCV API（默认True，速度快）
-            use_svm_api: SVM是否使用OpenCV预训练权重（默认True）
+            use_hog_api: HOG特征提取是否使用OpenCV API
+            use_svm_api: SVM是否使用OpenCV预训练权重
+            roi_ratio: ROI检测比例 (0.5=仅检测下半部, 加速且减少FP)
+            input_scale: 输入缩放系数 (0.75=缩至75%, 2-3x加速)
         """
         self.win_stride = win_stride
         self.padding = padding
@@ -303,6 +307,8 @@ class HOGDetector:
         self.split_merged_boxes = split_merged_boxes
         self.use_hog_api = use_hog_api
         self.use_svm_api = use_svm_api
+        self.roi_ratio = roi_ratio
+        self.input_scale = input_scale
         
         # 加载预训练权重（无论是否使用API都需要）
         detector = cv2.HOGDescriptor_getDefaultPeopleDetector()
@@ -347,9 +353,27 @@ class HOGDetector:
             detections: (N, 4) 边界框 [x1, y1, x2, y2]
             confidences: (N,) 置信度
         """
+        # 速度优化: ROI + 输入缩放
+        orig_h, orig_w = image.shape[:2]
+        roi_offset_x, roi_offset_y = 0, 0
+        
         if roi is not None:
             x, y, w, h = roi
             image = image[y:y+h, x:x+w]
+            roi_offset_x, roi_offset_y = x, y
+        elif self.roi_ratio < 1.0:
+            crop_h = int(orig_h * self.roi_ratio)
+            roi_offset_y = orig_h - crop_h
+            image = image[roi_offset_y:orig_h, :]
+        
+        if self.input_scale < 1.0:
+            new_w = int(image.shape[1] * self.input_scale)
+            new_h = int(image.shape[0] * self.input_scale)
+            scale_w = image.shape[1] / new_w
+            scale_h = image.shape[0] / new_h
+            image = cv2.resize(image, (new_w, new_h))
+        else:
+            scale_w, scale_h = 1.0, 1.0
         
         if self.use_hog_api:
             # 使用OpenCV API
@@ -406,12 +430,13 @@ class HOGDetector:
         if self.split_merged_boxes and len(detections) > 0:
             detections, confidences = self._split_merged_boxes(detections, confidences)
         
-        # 修正ROI偏移
-        if roi is not None:
-            detections[:, 0] += roi[0]
-            detections[:, 1] += roi[1]
-            detections[:, 2] += roi[0]
-            detections[:, 3] += roi[1]
+        # 修正ROI偏移 + 输入缩放
+        detections[:, [0, 2]] *= scale_w
+        detections[:, [1, 3]] *= scale_h
+        detections[:, 0] += roi_offset_x
+        detections[:, 1] += roi_offset_y
+        detections[:, 2] += roi_offset_x
+        detections[:, 3] += roi_offset_y
         
         return detections, confidences
     

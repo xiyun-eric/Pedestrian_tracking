@@ -29,13 +29,13 @@
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         检测层                                       │
 ├─────────────────────────────────────────────────────────────────────┤
-│  传统方法: HOG + SVM    │    深度方法: YOLO11 + LoRA微调             │
+│  传统方法: HOG+SVM  │  深度方法: YOLO11+LoRA微调  │  大模型方法: Qwen2-VL+LoRA │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         跟踪层                                       │
 ├─────────────────────────────────────────────────────────────────────┤
-│  传统方法: 光流+卡尔曼+级联匹配  │  深度方法: ByteTrack+ReID         │
+│  传统方法: 光流+卡尔曼+级联匹配  │  深度方法: ByteTrack+ReID  │  大模型方法: IoU后处理跟踪 │
 └─────────────────────────────────────────────────────────────────────┘
                               ↓
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -56,7 +56,11 @@
 | **模型微调**   | `deep_method/model/train_lora.py` | YOLO11微调训练             |
 | **传统方法跟踪** | `traditional_method/run_traditional.py` | HOG+SVM+卡尔曼 |
 | **深度方法跟踪** | `run_tracking_evaluation.py`      | YOLO+AdvancedTracker+ReID |
-| **对比评估** | `run_comparison.py`      | 多方法对比评估 |
+| **大模型SFT数据构建** | `model_method/build_sft_data.py` | 大模型SFT数据构建 |
+| **大模型LoRA微调** | `model_method/train.py` | Qwen2-VL LoRA微调训练 |
+| **大模型推理可视化** | `model_method/visualize.py` | 大模型推理可视化+IoU评测 |
+| **大模型MOT评估** | `model_method/evaluate.py` | 大模型MOT标准评估 |
+| **对比评估** | `run_comparison.py`      | 三种方法对比评估 (传统/深度/大模型) |
 
 ### 1.3 项目结构
 
@@ -76,11 +80,12 @@ cv_project/
 │   └── MOT17/                     # MOT17 数据集
 │
 ├── traditional_method/            # 传统方法
-│   ├── hog_detector.py            # HOG+SVM行人检测
+│   ├── hog_detector.py            # HOG+SVM行人检测（支持ROI裁剪+输入缩放）
 │   ├── kalman_filter.py           # 卡尔曼滤波
 │   ├── tracker.py                 # 轨迹管理
-│   ├── tracking_pipeline.py       # 跟踪管道
-│   └── run_traditional.py         # 运行脚本
+│   ├── tracking_pipeline.py       # 跟踪管道（支持跳帧检测+精细参数控制）
+│   ├── retrain_svm.py             # SVM自定义重训练
+│   └── run_traditional.py         # 运行脚本（支持速度优化参数）
 │
 ├── deep_method/                   # 深度学习方法
 │   ├── detector.py                # YOLO检测器封装
@@ -92,6 +97,18 @@ cv_project/
 │       ├── train_lora.py          # YOLO LoRA微调
 │       └── train_osnet_lora.py    # OSNet LoRA微调
 │
+├── model_method/                   # 大模型方法 (Qwen2-VL + LoRA)
+│   ├── build_sft_data.py           # SFT训练数据构建
+│   ├── dataset.py                  # SFT Dataset类
+│   ├── lora_config.py              # LoRA配置
+│   ├── losses.py                   # 自定义损失函数
+│   ├── rl_reward.py                # RL奖励函数
+│   ├── tracking_trainer.py         # 自定义Trainer
+│   ├── train.py                    # LoRA微调训练入口
+│   ├── visualize.py                # 推理可视化+IoU评测
+│   ├── evaluate.py                 # MOT标准评估
+│   └── ablation.py                 # 消融实验
+│
 ├── tools/                         # 工具集
 │   ├── dataset_creator.py         # 视频采集+分帧
 │   ├── annotator.py               # 标注工具
@@ -100,6 +117,7 @@ cv_project/
 │
 ├── run_tracking_evaluation.py     # 深度方法跟踪脚本
 ├── run_comparison.py              # 对比评估脚本
+├── outputs/                       # 输出目录 (可视化/对比结果)
 ├── configs/dataset.yaml           # 数据集配置
 └── docs/
     ├── README.md                  # 本文档
@@ -216,7 +234,36 @@ python traditional_method/run_traditional.py \
 | `--no-optical-flow` | -    | 禁用光流运动估计                      |
 | `--no-reid`         | -    | 禁用ReID重识别                     |
 
+### 3.3.1 传统方法高级参数与速度优化
+
+传统方法在核心算法不变的基础上，支持检测参数精细控制和速度优化：
+
+```bash
+# 速度优化：ROI裁剪（仅检测下半部，2倍加速）+ 输入缩放（75%，2-3倍加速）+ 跳帧检测
+python traditional_method/run_traditional.py \
+    --video data/custom/videos/scene1.mp4 \
+    --roi-ratio 0.5 --input-scale 0.75 --frame-skip 2
+
+# 自定义SVM重训练（适配特定场景）
+python traditional_method/retrain_svm.py \
+    --videos-dir data/custom/videos \
+    --labels-base data/yolo_custom/labels/val \
+    --scenes scene1 scene2
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--win-stride` | 8 | HOG滑动窗口步长，越小检测越密但越慢 |
+| `--nms-threshold` | 0.45 | NMS IoU阈值，越大保留越多重叠框 |
+| `--aspect-min` | 0.2 | 行人最小宽高比 |
+| `--aspect-max` | 0.85 | 行人最大宽高比 |
+| `--roi-ratio` | 1.0 | ROI检测比例（0.5=仅下半部，加速且减少误检） |
+| `--frame-skip` | 1 | 跳帧检测（2=隔帧检测，2倍加速） |
+| `--input-scale` | 1.0 | 输入缩放（0.75=缩至75%，2-3倍加速） |
+
 ### 3.4 深度方法跟踪
+
+#### 3.4.1 使用 run_tracking_evaluation.py（推荐）
 
 ```bash
 # 使用预训练模型
@@ -244,9 +291,56 @@ python run_tracking_evaluation.py \
 | `--labels` | `data/yolo_custom/labels/val`   | YOLO格式GT标注目录            |
 | `--scene`  | -                               | 场景名称过滤（如scene1, scene2） |
 
+#### 3.4.2 使用 deep_method/run_deep.py（高级）
+
+支持单独加载 YOLO LoRA 和 ReID LoRA 权重：
+
+```bash
+# 使用预训练模型（无LoRA）
+python deep_method/run_deep.py --video data/custom/videos/scene1.mp4 --frames 300
+
+# 仅使用 YOLO LoRA 微调
+python deep_method/run_deep.py --video data/custom/videos/scene3.mp4 \
+    --lora runs/yolo_lora/train/weights/lora_best.pt \
+    --output-dir outputs/custom/scene3 --frames 300
+
+# 同时使用 YOLO LoRA 和 ReID LoRA 微调
+python deep_method/run_deep.py --video data/custom/videos/scene3.mp4 \
+    --lora runs/yolo_lora/train/weights/lora_best.pt \
+    --reid-lora runs/reid/osnet_lora/best.pth \
+    --output-dir outputs/custom/scene3 --frames 300
+
+# scene4 示例
+python deep_method/run_deep.py --video data/custom/videos/scene4.mp4 \
+    --lora runs/yolo_lora/train/weights/lora_best.pt \
+    --reid-lora runs/reid/osnet_lora/best.pth \
+    --output-dir outputs/custom/scene4 --frames 300
+
+# scene5 示例
+python deep_method/run_deep.py --video data/custom/videos/scene5.mp4 \
+    --lora runs/yolo_lora/train/weights/lora_best.pt \
+    --reid-lora runs/reid/osnet_lora/best.pth \
+    --output-dir outputs/custom/scene5 --frames 300
+```
+
+| 参数         | 说明                      |
+| ---------- | ----------------------- |
+| `--video`  | 视频文件路径                  |
+| `--frames` | 最大处理帧数                  |
+| `--lora`   | YOLO LoRA权重路径（检测器微调）   |
+| `--reid-lora` | ReID LoRA权重路径（外观特征微调） |
+| `--output-dir` | 输出目录                  |
+| `--device` | 推理设备（cuda:0/cpu）       |
+| `--conf`   | 检测置信度阈值（默认0.25）        |
+| `--no-bytetrack` | 禁用ByteTrack低分框策略 |
+
 ### 3.5 对比评估（主要评估方式）
 
 `run_comparison.py` 是项目的主要评估脚本，用于对比三种方法的性能：
+
+- **traditional**: 传统方法 (HOG+SVM)
+- **deep_custom**: 深度方法 (微调YOLO)
+- **large_model**: 大模型方法 (Qwen2-VL+LoRA)
 
 ```bash
 # 对所有视频运行所有方法（scene5有GT标注）
@@ -255,14 +349,17 @@ python run_comparison.py --videos-scenes scene1 scene2 scene3 scene4 scene5 --fr
 # 只运行特定方法
 python run_comparison.py --videos-scenes scene5 --methods traditional --frames 100
 
-# MOT17数据集对比评估
-python run_comparison.py --mot17 --frames 200
+# MOT17数据集对比评估（默认3个序列，10帧）
+python run_comparison.py --mot17 --mot17-frames 10
 
 # 指定MOT17序列
-python run_comparison.py --mot17 --mot17-seq MOT17-04-FRCNN --frames 200
+python run_comparison.py --mot17 --mot17-seq MOT17-04-FRCNN --mot17-frames 10
 
-# 仅对比特定方法
-python run_comparison.py --mot17 --mot17-seq MOT17-04-FRCNN --methods traditional deep_pretrained
+# 仅对比传统和大模型方法
+python run_comparison.py --mot17 --mot17-seq MOT17-02-FRCNN --methods traditional large_model
+
+# 指定大模型推理输出目录
+python run_comparison.py --mot17 --methods large_model --large-model-output outputs/large_model
 ```
 
 | 参数            | 默认值          | 说明                                  |
@@ -270,9 +367,11 @@ python run_comparison.py --mot17 --mot17-seq MOT17-04-FRCNN --methods traditiona
 | `--videos-scenes` | - | 自采集视频场景名称（如scene1 scene2） |
 | `--mot17`     | -            | 启用 MOT17 数据集模式                      |
 | `--mot17-dir` | `data/MOT17` | MOT17 数据集根目录                        |
-| `--mot17-seq` | 自动发现         | 序列名称（如 MOT17-04-FRCNN），不指定则自动发现所有序列 |
-| `--methods`   | 全部方法 | 要运行的方法（traditional/deep_pretrained/deep_custom） |
-| `--frames`    | 150 | 处理帧数 |
+| `--mot17-seq` | MOT17-02-FRCNN,MOT17-04-FRCNN,MOT17-11-FRCNN | 序列名称，默认3个序列 |
+| `--mot17-frames` | 10 | MOT17每个序列处理帧数 |
+| `--methods`   | 全部方法 | 要运行的方法（traditional/deep_custom/large_model） |
+| `--frames`    | 150 | 自采集视频处理帧数 |
+| `--large-model-output` | `outputs/large_model` | 大模型方法推理输出目录 |
 | `--use-hog-api` | 开启 | 传统方法HOG特征提取使用OpenCV API |
 | `--no-hog-api` | - | 传统方法HOG特征提取使用手动实现 |
 | `--use-svm-api` | 开启 | 传统方法SVM使用OpenCV预训练权重 |
@@ -476,7 +575,13 @@ python tools/prepare_data.py --input data/custom --output data/yolo_custom
 # 4. 模型微调（可选）
 python deep_method/model/train_lora.py --data configs/dataset.yaml --epochs 30
 
-# 5. 对比评估
+# 5. 大模型方法（可选）
+# 5a. 构建SFT数据
+python model_method/build_sft_data.py --stages 1
+# 5b. LoRA微调训练
+python model_method/train.py --stage 1
+
+# 6. 对比评估
 python run_comparison.py --videos-scenes scene1 --frames 150
 ```
 
@@ -489,55 +594,46 @@ python traditional_method/run_traditional.py --video data/custom/videos/scene1.m
 # 深度方法（预训练模型）
 python run_tracking_evaluation.py --video data/custom/videos/scene1.mp4 --model pretrained
 
+# 大模型方法（需先完成训练）
+python model_method/visualize.py --mode detect_track --lora-path runs/stage1/final
+
 # 对比评估
 python run_comparison.py --videos-scenes scene1 --frames 150
 ```
 
 ***
 
-## 七、大模型方法：Qwen2-VL 端到端行人跟踪
+## 八、大模型方法：Qwen2-VL 行人检测与跟踪
 
-### 7.1 方案概述
+### 8.1 方案概述
 
-基于 Qwen2-VL-2B-Instruct 大模型，通过 LoRA 微调实现一体化端到端行人检测与跟踪。无需外部检测器，单个大模型直接输出 bbox + track_id。
+采用**方案B: 回归原生检测格式 + 后处理跟踪**。基于 Qwen2-VL-2B-Instruct 大模型，通过 LoRA 微调实现行人检测，再通过 IoU 后处理实现跨帧跟踪。Qwen2-VL 输出原生 bbox 格式（0-1000 坐标系），后处理阶段使用 IoU 匹配关联跨帧 ID。
 
 详细方案见 [QWEN2VL_TRACKING_PLAN.md](QWEN2VL_TRACKING_PLAN.md)。
 
-### 7.2 模块结构
+### 8.2 模块结构
 
 `model_method/` 目录整理后包含以下文件（按流程顺序）：
 
 | 文件 | 类别 | 说明 |
 |------|------|------|
-| `verify_model.py` | 模型验证 | 验证 Qwen2-VL 能否加载并输出 bbox 格式检测结果 |
 | `build_sft_data.py` | 数据处理 | 将 MOT17 标注转换为 Qwen2-VL SFT 训练格式 (JSONL) |
 | `dataset.py` | 数据处理 | SFT Dataset 类 (JSONL → Qwen2-VL 输入) |
-| `lora_config.py` | 模型训练 | LoRA 配置 (r=64, alpha=128) |
+| `lora_config.py` | 模型训练 | LoRA 配置 (r=8, alpha=16) |
 | `losses.py` | 模型训练 | 自定义损失函数 (坐标加权 + IoU + 跟踪一致性) |
 | `rl_reward.py` | 模型训练 | RL 奖励函数 (IoU 奖励 + ID 一致性奖励) |
 | `tracking_trainer.py` | 模型训练 | 自定义 Trainer (集成辅助损失) |
-| `train.py` | 模型训练 | LoRA 微调训练入口 (两阶段: 纯双帧跟踪SFT + GRPO RL) |
-| `visualize.py` | 模型推理 | 训练前后推理可视化对比 (detect/track/track10/track_dm) |
+| `train.py` | 模型训练 | LoRA 微调训练入口 (单帧检测SFT) |
+| `visualize.py` | 模型推理 | 推理可视化+IoU评测 (detect/detect_track) |
 | `evaluate.py` | 模型评估 | MOT 标准评估 (MOTA/MOTP/IDF1 等指标) |
 | `ablation.py` | 模型评估 | 消融实验 (A1-A7 共 11 个配置) |
 
-### 7.3 模型验证
-
-验证 Qwen2-VL 模型文件完整性、bbox 特殊 token、GPU 加载、单帧检测、LoRA 注入：
-
-```bash
-python model_method/verify_model.py
-```
-
-### 7.4 数据准备
+### 8.3 数据准备
 
 将 MOT17 标注转换为 Qwen2-VL SFT 训练格式（JSONL）：
 
 ```bash
-# 构建全部两个阶段的数据
-python model_method/build_sft_data.py --stages 1,2
-
-# 仅构建特定阶段
+# 构建 Stage 1 单帧检测数据
 python model_method/build_sft_data.py --stages 1
 ```
 
@@ -545,73 +641,71 @@ python model_method/build_sft_data.py --stages 1
 |------|--------|------|
 | `--mot17-root` | `data/MOT17` | MOT17 数据集根目录 |
 | `--output-dir` | `data` | 输出目录 |
-| `--stages` | `1,2` | 要构建的阶段（逗号分隔） |
+| `--stages` | `1` | 要构建的阶段（逗号分隔） |
 | `--skip-validation` | - | 跳过数据验证 |
 
 **生成文件**：
 
-| 文件 | 阶段 | 样本数 | 说明 |
-|------|------|--------|------|
-| `data/mot17_sft_stage1.jsonl` | Stage 1 | ~112 | 单帧检测（学习 bbox 格式） |
-| `data/mot17_sft_stage2.jsonl` | Stage 2 | ~255 | 双帧跟踪（学习跨帧 ID 关联） |
-| `data/mot17_sft_stage3.jsonl` | Stage 3 | ~170 | 多帧跟踪（提升精度） |
+| 文件 | 阶段 | 说明 |
+|------|------|------|
+| `data/mot17_sft_stage1.jsonl` | Stage 1 | 单帧检测数据（学习 bbox 输出格式） |
 
-**数据格式示例**：
+**数据格式示例**（单帧检测，Qwen2-VL 0-1000 坐标系）：
 
 ```json
 {
   "messages": [
     {"role": "user", "content": [
-      {"type": "image", "image": "path/to/frame1.jpg"},
-      {"type": "text", "text": "Detect all pedestrians..."}
+      {"type": "image", "image": "path/to/frame.jpg"},
+      {"type": "text", "text": "Detect all pedestrians in this image."}
     ]},
     {"role": "assistant", "content": [
-      {"type": "text", "text": "<ref>person</ref><box>(291,410),(371,652)</box>\n..."}
+      {"type": "text", "text": "<ref>person</ref><box>(291,410),(371,652)</box>\n<ref>person</ref><box>(512,398),(590,640)</box>"}
     ]}
   ]
 }
 ```
 
-### 7.5 LoRA 微调训练
+### 8.4 LoRA 微调训练
 
-两阶段训练：Stage 1 双帧跟踪 SFT → Stage 2 GRPO RL 精调。
+Stage 1: 单帧检测 SFT，让模型学习输出 Qwen2-VL 原生 bbox 格式（0-1000 坐标系）。
 
-**设计理念**：优先保证模型能输出跟踪结果（性能可以差一点，但必须能实现跟踪功能）。Stage 1 用纯双帧跟踪数据 SFT，让模型学会 ID 跟踪输出格式；Stage 2 用 GRPO RL 奖励优化跟踪精度。Qwen2-VL 原生支持 bbox 输出，用极小 LoRA (r=8, 仅0.4%参数) 学习跨帧 ID 关联。
+**设计理念**：采用方案B（回归原生检测格式 + 后处理跟踪），Qwen2-VL 原生支持 bbox 输出，用极小 LoRA (r=8, 仅0.4%参数) 微调单帧检测能力，跟踪通过 IoU 后处理实现。
 
 ```bash
-# Stage 1: 双帧跟踪 SFT (LoRA r=8, 学习跨帧 ID 关联)
+# Stage 1: 单帧检测 SFT (LoRA r=8, 学习 bbox 输出格式)
 python model_method/train.py --stage 1
-
-# Stage 2: GRPO RL 精调 (IoU奖励 + ID一致性奖励)
-python model_method/train.py --stage 2
-
-# 全流程训练
-python model_method/train.py --allstage
 
 # Quick 验证 (少量数据快速验证流程)
 python model_method/train.py --stage 1 --quick
-python model_method/train.py --allstage --quick
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--stage` | 1 | 训练阶段 (1=SFT跟踪, 2=GRPO RL) |
+| `--stage` | 1 | 训练阶段 (1=单帧检测SFT) |
 | `--qlora` | 关闭 | 使用 QLoRA 4bit 量化 |
 | `--no-qlora` | - | 不使用 QLoRA (fp16 训练) |
 | `--epochs` | 默认 | 覆盖训练轮次 |
 | `--lr` | 默认 | 覆盖学习率 |
 | `--quick` | - | 快速模式 (少量数据) |
-| `--allstage` | - | 一次性训练全部2个阶段 |
+
+**训练输出**：
+
+```
+runs/stage1/
+├── final/           # 最终 LoRA 权重
+└── checkpoint-*/    # 中间检查点
+```
 
 **LoRA 配置** (极小化, 保留检测能力):
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| r | 8 | LoRA 秩 (原64, 降低8倍) |
+| r | 8 | LoRA 秩 |
 | alpha | 16 | 缩放因子 |
 | target_modules | 7个 | q/k/v/o_proj + gate/up/down_proj |
-| 可训练参数 | ~9M (0.4%) | 原74M (3.24%), 降低8倍 |
-| 学习率 | 2e-5 | 适中, 确保学会跟踪格式 |
+| 可训练参数 | ~9M (0.4%) | 仅训练 LoRA 适配器 |
+| 学习率 | 2e-5 | 适中, 确保学会检测格式 |
 
 **辅助损失函数** (Stage 1 SFT):
 
@@ -619,77 +713,71 @@ python model_method/train.py --allstage --quick
 L_total = L_lm + λ·L_coord_weighted
 ```
 
-| 损失项 | 作用 | Stage 1 | Stage 2 |
-|--------|------|---------|---------|
-| L_lm | 标准 SFT 损失 | ✅ | ❌ (RL用奖励) |
-| L_coord_weighted | 坐标 token 加权 | ✅ λ=2.0 (每4步) | ❌ |
-| RL奖励 | IoU+ID一致性+格式 | ❌ | ✅ |
+| 损失项 | 作用 | Stage 1 |
+|--------|------|---------|
+| L_lm | 标准 SFT 损失 | ✅ |
+| L_coord_weighted | 坐标 token 加权 | ✅ λ=2.0 (每4步) |
 
-### 7.6 推理可视化
+### 8.5 推理可视化
 
-在 LoRA 微调前后测试 Qwen2-VL 在 MOT17 上的检测与跟踪能力，帮助区分模型本身能力不足 vs 微调训练不到位：
+在 LoRA 微调前后测试 Qwen2-VL 在 MOT17 上的检测能力，并进行 IoU 评测：
 
 ```bash
 # 单帧检测模式
 python model_method/visualize.py --mode detect
 
-# 双帧跟踪模式
-python model_method/visualize.py --mode track
+# 检测+IoU评测模式 (单帧检测 + IoU后处理跟踪)
+python model_method/visualize.py --mode detect_track
 
-# 10 帧跟踪模式
-python model_method/visualize.py --mode track10
+# 指定 LoRA 权重
+python model_method/visualize.py --mode detect_track --lora-path runs/stage1/final
 
-# 训练前后对比 (需先完成 Stage 1 训练)
-python model_method/visualize.py --mode compare --lora-path output/stage1/final
+# 指定序列和帧数
+python model_method/visualize.py --mode detect_track --seq-filter MOT17-02-FRCNN --max-frames 10
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--mode` | detect | 模式 (detect/track/track10/compare) |
-| `--lora-path` | - | LoRA 权重路径 (compare 模式必填) |
+| `--mode` | detect | 模式 (detect/detect_track) |
+| `--lora-path` | - | LoRA 权重路径 |
 | `--mot17-root` | `data/MOT17` | MOT17 数据集根目录 |
-| `--sequence` | MOT17-02-FRCNN | 评估序列 |
-| `--frame-idx` | 1 | 起始帧索引 |
+| `--seq-filter` | MOT17-02-FRCNN,MOT17-11-FRCNN | 评估序列（逗号分隔） |
+| `--max-frames` | 10 | 每个序列最大帧数 |
+| `--output-dir` | `outputs/visualizations` | 可视化输出目录 |
 
-### 7.7 MOT 标准评估
+### 8.6 MOT 标准评估
 
-基于 `motmetrics` 库计算 MOTA/MOTP/IDF1/IDSW/MT/ML/FP/FN 等全套 MOT 指标。流程：加载模型 → 滑动窗口推理 → 跨窗口 IoU 匹配 ID 关联 → 保存 MOT 格式 → 计算指标。
+基于 `motmetrics` 库计算 MOTA/MOTP/IDF1/IDSW/MT/ML/FP/FN 等全套 MOT 指标。流程：加载模型 → 逐帧推理检测 → IoU 后处理跟踪 → 保存 MOT 格式 → 计算指标。
 
 ```bash
 # 推理并评估指定 LoRA 权重
-python model_method/evaluate.py --lora-path output/stage2/final
+python model_method/evaluate.py --lora-path runs/stage1/final
 
 # 评估原始模型 (无 LoRA)
 python model_method/evaluate.py --no-lora
 
-# 快速模式 (只评估前 20 帧)
-python model_method/evaluate.py --lora-path output/stage2/final --quick
+# 指定序列和帧数
+python model_method/evaluate.py --lora-path runs/stage1/final \
+    --seq-filter MOT17-02-FRCNN,MOT17-11-FRCNN --max-frames 10
 
 # 只评估已有结果文件 (不重新推理)
-python model_method/evaluate.py --eval-only --result-dir output/mot_results
-
-# 指定序列和窗口参数
-python model_method/evaluate.py --lora-path output/stage2/final \
-    --sequences MOT17-02-FRCNN --window-size 2 --stride 1
+python model_method/evaluate.py --eval-only --result-dir outputs/mot_results
 ```
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--lora-path` | `output/stage1/final` | LoRA 权重路径 |
+| `--lora-path` | `runs/stage1/final` | LoRA 权重路径 |
 | `--no-lora` | - | 评估原始模型 (无 LoRA) |
 | `--model-path` | `Qwen` | 基座模型路径 |
 | `--mot17-root` | `data/MOT17` | MOT17 数据集根目录 |
-| `--sequences` | 全部 | 评估序列 (逗号分隔, 如 MOT17-02-FRCNN,MOT17-04-FRCNN) |
-| `--window-size` | 2 | 滑动窗口大小 (帧数) |
-| `--stride` | 1 | 滑动步长 |
-| `--max-frames` | 全部 | 每个序列最大帧数 |
-| `--iou-threshold` | 0.3 | 跨窗口 ID 匹配的 IoU 阈值 |
-| `--quick` | - | 快速模式 (仅前 20 帧) |
+| `--seq-filter` | MOT17-02-FRCNN,MOT17-11-FRCNN | 评估序列（逗号分隔） |
+| `--max-frames` | 10 | 每个序列最大帧数 |
+| `--iou-threshold` | 0.3 | IoU 后处理跟踪匹配阈值 |
 | `--eval-only` | - | 只评估已有结果文件, 不重新推理 |
 
 **输出指标**：MOTA、MOTP、IDF1、IDP、IDR、IDSW、MT、ML、FP、FN、TP、Precision、Recall、Frag
 
-### 7.8 消融实验
+### 8.7 消融实验
 
 实现方案文档中定义的 7 组共 11 个消融配置，自动训练 + 评估 + 生成对比报告：
 

@@ -37,6 +37,7 @@ debug_*.txt
 track10_log.txt
 ver.txt
 trae-sandbox.cmd
+edit_readme.ps1
 
 # ============================================================
 # 大模型权重 (GitHub 单文件限制 100MB, 必须排除)
@@ -57,6 +58,11 @@ data/MOT17/*/img1/
 data/MOT17/*/det/
 data/MOT17/*/gt/
 
+# 自定义数据集图片和视频
+data/custom/images/
+data/custom/videos/
+data/yolo_custom/
+
 # SFT 数据文件 (可由 build_sft_data.py 重新生成)
 data/*.jsonl
 
@@ -71,6 +77,7 @@ runs/
 # 安装包 / 大型依赖
 # ============================================================
 ku/
+model_method.zip
 
 # ============================================================
 # 文档 (只保留 README.md)

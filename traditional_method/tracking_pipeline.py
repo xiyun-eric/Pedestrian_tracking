@@ -49,11 +49,19 @@ from traditional_method.feature_extraction import FeatureExtractor, ReIDMatcher,
 class TraditionalTrackingConfig:
     """传统方法跟踪配置"""
     # 检测参数
-    hog_win_stride: Tuple[int, int] = (8, 8)
-    hog_scale: float = 1.05
+    hog_win_stride: int = 8        # 滑动窗口步长（像素），越小检测越密
+    hog_scale: float = 1.05        # 图像金字塔缩放系数，越小金子塔越密
     hog_conf_threshold: float = 0.3  # 置信度阈值（平衡召回率与精确率）
+    hog_nms_threshold: float = 0.45  # NMS IoU 阈值，越大保留越多重叠检测
+    hog_aspect_min: float = 0.2      # 行人最小宽高比
+    hog_aspect_max: float = 0.85     # 行人最大宽高比
     use_hog_api: bool = True         # HOG特征提取是否使用OpenCV API（默认True，速度快）
     use_svm_api: bool = True         # SVM是否使用OpenCV预训练权重（默认True）
+    
+    # 速度优化参数
+    roi_ratio: float = 1.0           # ROI检测比例 (0.5=仅下半部, 1.0=全图)
+    frame_skip: int = 1              # 跳帧检测 (1=每帧检测, 2=隔帧检测)
+    input_scale: float = 1.0         # 输入缩放 (0.75=缩至75%再检测, 1.0=原始)
     
     # 跟踪参数
     max_age: int = 15             # 轨迹最大丢失帧数（缩短以减少幽灵框）
@@ -197,11 +205,16 @@ class TraditionalTrackingPipeline:
         
         # 初始化各模块
         self.detector = HOGDetector(
-            win_stride=self.config.hog_win_stride,
+            win_stride=(self.config.hog_win_stride, self.config.hog_win_stride),
             scale=self.config.hog_scale,
             conf_threshold=self.config.hog_conf_threshold,
+            nms_threshold=self.config.hog_nms_threshold,
+            aspect_ratio_min=self.config.hog_aspect_min,
+            aspect_ratio_max=self.config.hog_aspect_max,
             use_hog_api=self.config.use_hog_api,
             use_svm_api=self.config.use_svm_api,
+            roi_ratio=self.config.roi_ratio,
+            input_scale=self.config.input_scale,
         )
         
         self.flow_estimator = OpticalFlowEstimator(
@@ -303,8 +316,14 @@ class TraditionalTrackingPipeline:
             
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             
-            # === 步骤1: HOG+SVM 行人检测 ===
-            detections, confidences = self.detector.detect(frame)
+            # === 步骤1: HOG+SVM 行人检测 (支持跳帧)
+            if frame_idx % self.config.frame_skip == 0 or not hasattr(self, '_cached_detections'):
+                detections, confidences = self.detector.detect(frame)
+                self._cached_detections = detections
+                self._cached_confidences = confidences
+            else:
+                detections = self._cached_detections
+                confidences = self._cached_confidences
             stats["total_detections"] += len(detections)
             
             # === 步骤2: 光流计算 ===
@@ -507,8 +526,14 @@ class TraditionalTrackingPipeline:
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # HOG+SVM 行人检测
-            detections, confidences = self.detector.detect(frame)
+            # HOG+SVM 行人检测 (支持跳帧加速)
+            if frame_idx % self.config.frame_skip == 0 or not hasattr(self, '_cached_detections'):
+                detections, confidences = self.detector.detect(frame)
+                self._cached_detections = detections
+                self._cached_confidences = confidences
+            else:
+                detections = self._cached_detections
+                confidences = self._cached_confidences
             stats["total_detections"] += len(detections)
 
             # 光流计算
@@ -674,5 +699,9 @@ class TraditionalTrackingPipeline:
         """重置所有状态"""
         self.tracker.reset()
         self.flow_estimator.reset()
+        if hasattr(self, '_cached_detections'):
+            del self._cached_detections
+        if hasattr(self, '_cached_confidences'):
+            del self._cached_confidences
         if self.reid_matcher:
             self.reid_matcher.clear()
